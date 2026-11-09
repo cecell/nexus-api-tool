@@ -26,9 +26,9 @@ The game defaults to `skyrimspecialedition`. The mod id is the number in the mod
 |---|---|---|
 | `desc <mod>` | name, author, uploader, version, status, summary, description | yes |
 | `changelog <mod>` | the changelog, per version | yes |
-| `files <mod>` | every non-archived file, grouped into `main`, `update`, `optional`, `miscellaneous`, `old` | yes |
-| `archived-files <mod>` | the same for `archived` and `removed` files | yes |
-| `file-note <mod> <file#>` | the note on one file | yes |
+| `files <mod>` | every non-archived file, grouped into `main`, `update`, `optional`, `miscellaneous`, `old` | no |
+| `archived-files <mod>` | the same for `archived` and `removed` files | no |
+| `file-note <mod> <file#>` | the note on one file | no |
 | `dl-file <mod> <file#> --dest <path>` | downloads the file (needs a Premium account) | yes |
 | `permissions <mod or address>` | the page's Permissions and credits section; see [Permissions](#permissions) | no |
 | `reqs <mod>` | the mods, external links and DLC this mod requires | no |
@@ -39,7 +39,9 @@ The game defaults to `skyrimspecialedition`. The mod id is the number in the mod
 | `upload-file <mod> --file <path> --name <label> --file-version <v>` | uploads an archive | yes |
 
 Each file has `file_id`, `label`, `version`, `category`, `uploaded`, `uploaded_timestamp`, `note`, `file_name`,
-`size_bytes`, `size_kb` and `primary`. Within a category, the newest comes first.
+`size_bytes`, `size_kb` and `primary`. Within a category, the newest comes first. `file_name` is null for newer uploads,
+where Nexus doesn't report it in the file list. These three commands also work on unpublished mods; `desc` and `changelog`
+don't, because only the older API offers them and it refuses those mods.
 
 `--dest` is a folder (it must exist, or end in `\`) or a file name. An existing file is only replaced with `--force`.
 The download is written to `<name>.part` and renamed once its size has been checked.

@@ -1,7 +1,7 @@
 // nexus-api-tool: read a Nexus Mods page's information from the command line. See README.md.
 //
-// Sources: the v1 REST API (needs an API key) for description, changelog and files, the public v2 GraphQL API for
-// requirements and dependents. Everything is printed as JSON (UTF-8) on stdout; errors go to stderr.
+// Sources: the v1 REST API (needs an API key) for description, changelog and downloads, the public v2 GraphQL API for
+// file lists, requirements and dependents, and the v3 REST API for changing a mod page. Everything is printed as JSON (UTF-8) on stdout; errors go to stderr.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -17,6 +17,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -89,7 +90,7 @@ OPTIONS
   --help, --version
 
 API KEY
-  Everything except permissions, reqs, dependents and list-mods reads your personal API key from the
+  desc, changelog, dl-file, save-desc, set-desc and upload-file read your personal API key from the
   NEXUS_API_KEY environment variable (nexusmods.com > Site preferences > API Keys).
 
 EXIT CODES
@@ -390,19 +391,53 @@ std::string category_key(int id) {
 
 bool is_archived(int category) { return category == 6 || category == 7; }
 
+std::string iso_time(long long timestamp) {
+    std::time_t t = static_cast<std::time_t>(timestamp);
+    std::tm utc{};
+    gmtime_s(&utc, &t);
+    char buffer[40];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S.000+00:00", &utc);
+    return buffer;
+}
+
+// One object from the GraphQL modFiles list.
 json file_object(const json& f) {
-    int category = f.value("category_id", 0);
-    return {{"file_id", value_of(f, "file_id")},
+    int category = f.value("categoryId", 0);
+    long long uploaded = f.value("date", 0LL);
+    std::string uri = text_of(f, "uri");
+    std::string bytes = text_of(f, "sizeInBytes");
+    return {{"file_id", value_of(f, "fileId")},
             {"label", clean_text(text_of(f, "name"))},
             {"version", value_of(f, "version")},
             {"category", category_key(category)},
-            {"uploaded", value_of(f, "uploaded_time")},
-            {"uploaded_timestamp", value_of(f, "uploaded_timestamp")},
+            {"uploaded", iso_time(uploaded)},
+            {"uploaded_timestamp", uploaded},
             {"note", clean_text(text_of(f, "description"))},
-            {"file_name", value_of(f, "file_name")},
-            {"size_bytes", value_of(f, "size_in_bytes")},
-            {"size_kb", value_of(f, "size_kb")},
-            {"primary", value_of(f, "is_primary")}};
+            {"file_name", uri.empty() || uri.find('/') != std::string::npos ? json(nullptr) : json(uri)},  // newer uploads hold a storage path here
+            {"size_bytes", bytes.empty() ? json(nullptr) : json(std::stoll(bytes))},
+            {"size_kb", value_of(f, "size")},
+            {"primary", f.value("primary", 0) != 0}};
+}
+
+std::string game_number(const std::string& game) {
+    if (game == kDefaultGame) return "1704";  // saves a request in the usual case
+    try {
+        return std::to_string(graphql("query($d:String!){game(domainName:$d){id}}", {{"d", game}})["game"]["id"].get<long long>());
+    } catch (const Failure&) {
+        fail("Nexus has no game with the domain " + game);
+    }
+}
+
+// Every file of a mod, whatever its category, in one request. Unlike v1 this also works on unpublished mods.
+json mod_files(const Target& t) {
+    json files = graphql("query($m:ID!,$g:ID!){modFiles(modId:$m,gameId:$g){fileId name version categoryId description size sizeInBytes date primary uri}}",
+                         {{"m", t.mod}, {"g", game_number(t.game)}})["modFiles"];
+    if (files.empty()) {  // a mod with no files and a mod that doesn't exist look the same here
+        json nodes = graphql("query($ids:[CompositeDomainWithIdInput!]!){legacyModsByDomain(ids:$ids){nodes{modId}}}",
+                             {{"ids", json::array({{{"gameDomain", t.game}, {"modId", t.mod_id()}}})}})["legacyModsByDomain"]["nodes"];
+        if (nodes.empty()) fail("mod " + t.mod + " not found");
+    }
+    return files;
 }
 
 json cmd_desc(const Target& t) {
@@ -436,10 +471,10 @@ json cmd_changelog(const Target& t) {
 }
 
 json cmd_files(const Target& t, bool archived) {
-    json listing = v1_get(t.v1_mod() + "/files.json");
+    json listing = mod_files(t);
     std::map<int, std::vector<json>> groups;
-    for (const auto& f : listing["files"]) {
-        int category = f.value("category_id", 0);
+    for (const auto& f : listing) {
+        int category = f.value("categoryId", 0);
         if (is_archived(category) == archived) groups[category].push_back(f);
     }
     std::vector<int> order = archived ? std::vector<int>{7, 6} : std::vector<int>{1, 2, 3, 5, 4};
@@ -451,7 +486,7 @@ json cmd_files(const Target& t, bool archived) {
     for (int id : order) {
         auto& files = groups[id];
         std::stable_sort(files.begin(), files.end(), [](const json& a, const json& b) {
-            return a.value("uploaded_timestamp", 0LL) > b.value("uploaded_timestamp", 0LL);
+            return a.value("date", 0LL) > b.value("date", 0LL);
         });
         json list = json::array();
         for (const auto& f : files) list.push_back(file_object(f));
@@ -465,8 +500,10 @@ json cmd_files(const Target& t, bool archived) {
 }
 
 json cmd_file_note(const Target& t, const std::string& file) {
-    json f = v1_get(t.v1_mod() + "/files/" + file + ".json");
-    json o = file_object(f);
+    json files = mod_files(t);
+    auto f = std::find_if(files.begin(), files.end(), [&](const json& x) { return x.value("fileId", 0LL) == std::stoll(file); });
+    if (f == files.end()) fail("mod " + t.mod + " has no file " + file);
+    json o = file_object(*f);
     json out = t.header();
     for (const char* k : {"file_id", "label", "version", "category", "uploaded", "note"}) out[k] = o[k];
     return out;
