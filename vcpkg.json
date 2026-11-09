@@ -1,0 +1,5 @@
+{
+  "name": "nexus-api-tool",
+  "version": "0.1.0",
+  "dependencies": [ "nlohmann-json" ]
+}
