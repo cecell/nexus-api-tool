@@ -64,7 +64,8 @@ COMMANDS
   dl-file <mod> <file#> --dest <path> download one file; <path> is a folder or a file name.
                                       Needs a Premium account. --force replaces an existing file
   file-note <mod> <file#>             the note on one file
-  permissions <mod>                   what the API can tell about permissions (see README)
+  permissions <mod or address>        the page's Permissions and credits section. If Nexus turns the program
+                                      away, --html <saved page> reads a page saved from a browser (see README)
   reqs <mod>                          what this mod requires
   dependents <mod>                    the mods that require this mod
   list-mods <user>                    the mods a user uploaded, newest first
@@ -359,6 +360,8 @@ std::string strip_bbcode(const std::string& s) {
 
 // ---------------------------------------------------------------- commands
 
+std::string read_file(const fs::path& path);
+
 struct Target {
     std::string game;
     std::string mod;
@@ -637,20 +640,147 @@ void add_mentions(json& mentions, const char* source, const std::string& text) {
     }
 }
 
-json cmd_permissions(const Target& t) {
+std::string tag_text(const std::string& html) {
+    std::string plain;
+    bool in_tag = false;
+    for (char c : html) {
+        if (c == '<') {
+            in_tag = true;
+            plain += ' ';
+        } else if (c == '>') {
+            in_tag = false;
+        } else if (!in_tag) {
+            plain += c;
+        }
+    }
+    std::string text = clean_text(plain), out;
+    for (char c : text) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            if (!out.empty() && out.back() != ' ') out += ' ';
+        } else {
+            out += c;
+        }
+    }
+    if (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+// The text after the next occurrence of `marker`, from its closing '>' up to `close`. Moves pos past it.
+std::string element_after(const std::string& s, size_t& pos, const std::string& marker, const std::string& close) {
+    size_t at = s.find(marker, pos);
+    if (at == std::string::npos) return {};
+    size_t open = s.find('>', at);
+    if (open == std::string::npos) return {};
+    size_t end = s.find(close, open);
+    if (end == std::string::npos) return {};
+    pos = end + close.size();
+    return tag_text(s.substr(open + 1, end - open - 1));
+}
+
+// The "Permissions and credits" section of a mod page, or null if the page doesn't have one.
+json parse_permissions(const std::string& page) {
+    size_t heading = page.find("Permissions and credits");
+    if (heading == std::string::npos) return nullptr;
+    size_t dd = page.find("<dd", heading);
+    size_t dd_end = dd == std::string::npos ? dd : page.find("</dd>", dd);
+    if (dd_end == std::string::npos) return nullptr;
+    std::string section = page.substr(dd, dd_end - dd);
+
+    json sections = json::object();
+    const std::string block_marker = "class=\"tabbed-block\"";
+    for (size_t at = section.find(block_marker); at != std::string::npos;) {
+        size_t next = section.find(block_marker, at + 1);
+        std::string block = section.substr(at, next == std::string::npos ? next : next - at);
+        size_t pos = 0;
+        std::string title = element_after(block, pos, "<h3", "</h3>");
+        size_t body = pos;
+        json items = json::array();
+        for (size_t li = block.find("<li", pos); li != std::string::npos; li = block.find("<li", pos)) {
+            std::string head = block.substr(li, block.find('>', li) - li);
+            pos = li + 3;
+            const char* state = head.find("permission-yes") != std::string::npos     ? "yes"
+                                : head.find("permission-no") != std::string::npos    ? "no"
+                                : head.find("permission-maybe") != std::string::npos ? "maybe"
+                                                                                     : nullptr;
+            if (!state) continue;
+            std::string item = element_after(block, pos, "permissions-title", "</span>");
+            std::string text = element_after(block, pos, "permissions-desc", "</span>");
+            items.push_back({{"state", state}, {"title", item}, {"text", text}});
+        }
+        if (!title.empty()) sections[title] = items.empty() ? json(tag_text(block.substr(body))) : items;
+        at = next;
+    }
+    return sections;
+}
+
+// Browsers save a page as MHTML: a mail-style file with the HTML quoted-printable encoded. Plain HTML passes through.
+std::string html_from_saved_page(const std::string& raw) {
+    size_t multipart = raw.substr(0, 4096).find("multipart/related");
+    if (multipart == std::string::npos) return raw;
+    size_t b = raw.find("boundary=\"", multipart);
+    size_t type = raw.find("Content-Type: text/html");
+    size_t headers_end = type == std::string::npos ? type : raw.find("\r\n\r\n", type);
+    if (b == std::string::npos || headers_end == std::string::npos) fail("couldn't find the page inside that saved file");
+    b += 10;
+    std::string boundary = "--" + raw.substr(b, raw.find('"', b) - b);
+    size_t begin = headers_end + 4, end = raw.find(boundary, begin);
+    std::string body = raw.substr(begin, end == std::string::npos ? end : end - begin);
+    if (raw.substr(type, headers_end - type).find("quoted-printable") == std::string::npos) return body;
+    std::string out;
+    out.reserve(body.size());
+    auto hex = [](char c) { return c <= '9' ? c - '0' : (c & ~0x20) - 'A' + 10; };
+    for (size_t i = 0; i < body.size(); ++i) {
+        if (body[i] != '=') {
+            out += body[i];
+        } else if (i + 1 < body.size() && body[i + 1] == '\n') {
+            i += 1;
+        } else if (i + 2 < body.size() && body[i + 1] == '\r' && body[i + 2] == '\n') {
+            i += 2;
+        } else if (i + 2 < body.size() && std::isxdigit(static_cast<unsigned char>(body[i + 1])) && std::isxdigit(static_cast<unsigned char>(body[i + 2]))) {
+            out += static_cast<char>(hex(body[i + 1]) * 16 + hex(body[i + 2]));
+            i += 2;
+        }
+    }
+    return out;
+}
+
+json cmd_permissions(const Target& t, const std::string& saved_page) {
+    json out = t.header();
+    out["page_url"] = t.page();
+    std::string page;
+    if (!saved_page.empty()) {
+        page = html_from_saved_page(read_file(to_wide(saved_page)));
+        out["source"] = "saved_page";
+    } else {
+        std::string text;
+        Http r = send("GET", t.page(), {"Accept: text/html"}, "", [&](const char* p, size_t n) { text.append(p, n); });
+        if (r.status == 200) {
+            page = text;
+            out["source"] = "live_page";
+        } else {
+            out["source"] = "api_only";
+            out["page_status"] = r.status;
+        }
+    }
+    if (!page.empty()) {
+        json sections = parse_permissions(page);
+        if (sections.is_null()) fail("that page has no Permissions and credits section. Unpublished and hidden pages only show it when you are signed in: save the page from your browser and pass it with --html <file>");
+        out["sections"] = sections;
+        return out;
+    }
+
+    // The page itself refused this program, so report what the API knows.
     json mod = single_mod("query($ids:[CompositeDomainWithIdInput!]!){legacyModsByDomain(ids:$ids){nodes{name author description uploader{name about}}}}",
                           ids_variable(t));
     json mentions = json::array();
     add_mentions(mentions, "description", clean_text(text_of(mod, "description")));
     if (mod.contains("uploader") && mod["uploader"].is_object())
         add_mentions(mentions, "uploader_profile", clean_text(text_of(mod["uploader"], "about")));
-    json out = t.header();
     out["name"] = value_of(mod, "name");
     out["author"] = value_of(mod, "author");
     out["uploader"] = mod["uploader"].is_object() ? value_of(mod["uploader"], "name") : json(nullptr);
-    out["checklist"] = nullptr;
-    out["checklist_note"] = "The Permissions and credits checklist is only on the mod page; no Nexus API returns it. See page_url.";
-    out["page_url"] = t.page() + "?tab=description";
+    out["sections"] = nullptr;
+    out["message"] = "Nexus didn't let this program read the page (see page_status). Open page_url in a browser, or save the page and pass it with --html <file>.";
     out["mentions"] = mentions;
     return out;
 }
@@ -869,11 +999,14 @@ json cmd_upload_file(const Target& t, const UploadArgs& a) {
     json mod = v3_mod(t);
     std::string mod_uuid = text_of(mod, "id"), group, category = a.category;
     if (!a.replaces.empty()) {
-        json old_file = v1_get(t.v1_mod() + "/files/" + a.replaces + ".json");  // 404s if it isn't this mod's file
-        group = text_of(v3_call("GET", "/games/" + t.game + "/mod-file-versions/" + a.replaces)["data"]["file"], "id");
+        json version = v3_call("GET", "/games/" + t.game + "/mod-file-versions/" + a.replaces)["data"];
+        group = text_of(version["file"], "id");
         if (group.empty()) fail("could not find the file group of file " + a.replaces);
+        json groups = v3_call("GET", "/mods/" + mod_uuid + "/files")["data"]["mod_files"];
+        if (std::none_of(groups.begin(), groups.end(), [&](const json& g) { return text_of(g, "id") == group; }))
+            fail("file " + a.replaces + " doesn't belong to mod " + t.mod);
         if (category.empty()) {
-            std::string old_category = category_key(old_file.value("category_id", 0));
+            std::string old_category = text_of(version, "category");
             category = old_category == "optional" || old_category == "miscellaneous" ? old_category : "main";
         }
     }
@@ -990,7 +1123,7 @@ const std::vector<CommandSpec>& command_specs() {
         {"archived-files", 1, {}},
         {"dl-file", 2, {"--dest", "--force"}},
         {"file-note", 2, {}},
-        {"permissions", 1, {}},
+        {"permissions", 1, {"--html"}},
         {"reqs", 1, paged},
         {"dependents", 1, paged},
         {"list-mods", 1, paged},
@@ -1003,7 +1136,7 @@ const std::vector<CommandSpec>& command_specs() {
 
 int run(const std::vector<std::string>& args) {
     static const std::set<std::string> with_value = {"--game", "--dest", "--limit", "--offset", "--file", "--backup-dir", "--name",
-                                                     "--file-version", "--replaces", "--category", "--note", "--changelog"};
+                                                     "--file-version", "--replaces", "--category", "--note", "--changelog", "--html"};
     static const std::set<std::string> flags = {"--force", "--dry-run", "--allow-html", "--set-mod-version"};
     std::vector<std::string> positional;
     std::map<std::string, std::string> options;
@@ -1048,6 +1181,20 @@ int run(const std::vector<std::string>& args) {
         }
     }
 
+    // permissions also takes a mod page's address
+    if (command == "permissions" && positional.size() == 2 && !all_digits(positional[1])) {
+        std::string url = positional[1];
+        size_t mods = url.find("/mods/");
+        size_t host = url.find("nexusmods.com/");
+        if (host == std::string::npos || mods == std::string::npos) bad_args("the mod id must be a number or a mod page's address");
+        std::string id = url.substr(mods + 6, url.find_first_not_of("0123456789", mods + 6) == std::string::npos ? std::string::npos : url.find_first_not_of("0123456789", mods + 6) - mods - 6);
+        size_t from = host + 14;
+        std::string domain = url.substr(from, mods - from);
+        if (domain.rfind("games/", 0) == 0) domain.erase(0, 6);
+        if (!all_digits(id) || !valid_game(domain)) bad_args("that isn't a mod page's address");
+        positional[1] = id;
+        game = domain;
+    }
     bool lists_user = command == "list-mods";
     bool takes_file = spec->positional == 2;
     if (static_cast<int>(positional.size()) != spec->positional + 1)
@@ -1075,7 +1222,7 @@ int run(const std::vector<std::string>& args) {
     else if (command == "archived-files") result = cmd_files(t, true);
     else if (command == "dl-file") result = cmd_dl_file(t, positional[2], option("--dest"), has("--force"));
     else if (command == "file-note") result = cmd_file_note(t, positional[2]);
-    else if (command == "permissions") result = cmd_permissions(t);
+    else if (command == "permissions") result = cmd_permissions(t, option("--html"));
     else if (command == "reqs") result = cmd_reqs(t);
     else if (command == "dependents") result = cmd_dependents(t);
     else if (command == "list-mods") result = cmd_list_mods(t, positional[1]);

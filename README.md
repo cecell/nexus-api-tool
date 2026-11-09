@@ -30,7 +30,7 @@ The game defaults to `skyrimspecialedition`. The mod id is the number in the mod
 | `archived-files <mod>` | the same for `archived` and `removed` files | yes |
 | `file-note <mod> <file#>` | the note on one file | yes |
 | `dl-file <mod> <file#> --dest <path>` | downloads the file (needs a Premium account) | yes |
-| `permissions <mod>` | see [Permissions](#permissions) | no |
+| `permissions <mod or address>` | the page's Permissions and credits section; see [Permissions](#permissions) | no |
 | `reqs <mod>` | the mods, external links and DLC this mod requires | no |
 | `dependents <mod>` | the mods that require this mod | no |
 | `list-mods <user>` | the mods a user uploaded for the game, newest first | no |
@@ -50,7 +50,7 @@ The download is written to `<name>.part` and renamed once its size has been chec
 by default and at most 200 (`--limit`), which is at most 4 API requests. The output has `total`, `offset`, `returned` and
 `next_offset`; pass `--offset <next_offset>` to continue, and stop when it is `null`.
 
-Every other command is a single API request, except `dl-file`, which makes two plus the download.
+The other read commands are a single request, except `dl-file`, which makes two plus the download.
 
 ### Changing a description page
 
@@ -89,10 +89,20 @@ Uploads and page changes show on the mod page right away, so try `--dry-run` fir
 
 ### Permissions
 
-No Nexus API returns the page's "Permissions and credits" checklist, and the mod page itself can't be read by a
-program (it sits behind a Cloudflare check). So `permissions` returns `checklist: null`, the `page_url` to read it in
-a browser, and `mentions`: the lines of the description and of the uploader's profile that talk about permissions,
-modifying or patches. Mentions are a hint to read further, not a grant.
+```
+nexus-api-tool permissions 12345
+nexus-api-tool permissions "https://www.nexusmods.com/skyrimspecialedition/mods/12345"
+nexus-api-tool permissions 12345 --html "saved page.mhtml"
+```
+
+No Nexus API returns the "Permissions and credits" section, so this command reads it from the mod page. `sections` holds
+each heading of that section: the checklist as a list of `state` (`yes`, `no` or `maybe`), `title` and `text`, and the
+rest (author notes, file credits, Donation Points) as text. `source` says where it came from.
+
+The tool isn't signed in, so unpublished and hidden pages can't be read from their address. Save one from your browser
+(`.html` or `.mhtml`) and pass it with `--html`. If Nexus ever turns the program away from a public page, `source` is
+`api_only`, `sections` is null, and `mentions` lists the lines of the description and of the uploader's profile that talk
+about permissions, modifying or patches. Mentions are a hint to read further, not a grant.
 
 ## Exit codes
 
