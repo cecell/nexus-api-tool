@@ -5,7 +5,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "")
 
 # The one place for the version: the exe and the release workflow both read it from here.
-project(nexus_api_tool VERSION 0.1.0 LANGUAGES CXX)
+project(nexus_api_tool VERSION 0.2.0 LANGUAGES CXX)
 
 find_package(nlohmann_json CONFIG REQUIRED)
 
