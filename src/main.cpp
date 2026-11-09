@@ -6,17 +6,22 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <bcrypt.h>
+#include <wincrypt.h>
 #include <winhttp.h>
 
 #include <fcntl.h>
 #include <io.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,6 +42,8 @@ constexpr const char* kToolVersion = APP_VERSION;  // from CMakeLists.txt
 constexpr const char* kDefaultGame = "skyrimspecialedition";
 constexpr const char* kV1 = "https://api.nexusmods.com/v1";
 constexpr const char* kGraphQl = "https://api.nexusmods.com/v2/graphql";
+constexpr const char* kV3 = "https://api.nexusmods.com/v3";
+constexpr long long kMaxUploadBytes = 100LL * 1024 * 1024;  // larger files need the API's multipart upload
 constexpr int kPageSize = 50;  // 100 goes over the GraphQL API's query complexity limit
 // One call never asks for more than this, so a mod with thousands of dependents can't run up the API
 // rate limit or flood the caller. The output gives next_offset to continue from.
@@ -60,17 +67,28 @@ COMMANDS
   permissions <mod>                   what the API can tell about permissions (see README)
   reqs <mod>                          what this mod requires
   dependents <mod>                    the mods that require this mod
-                                      reqs and dependents return 50 entries by default, at most 200
-                                      per call; use next_offset from the output with --offset
+  list-mods <user>                    the mods a user uploaded, newest first
+                                      reqs, dependents and list-mods return 50 entries by default,
+                                      at most 200 per call; use next_offset from the output with --offset
+
+  save-desc <mod> --dest <path>       save the description page as a BBCode text file
+  set-desc <mod> --file <path>        REPLACE the description page with a BBCode text file. The current
+                                      page is backed up first; if that fails nothing is changed.
+                                      Options: --backup-dir <folder>, --dry-run, --allow-html
+  upload-file <mod> --file <path> --name <label> --file-version <v>
+                                      upload an archive as a new file (under 100 MiB).
+                                      Options: --replaces <file#> (new version of that file, the old one
+                                      is archived), --category main|optional|miscellaneous, --note <text>,
+                                      --changelog <text>, --set-mod-version, --dry-run, --allow-html
 
 OPTIONS
   --game <domain>   the game's Nexus domain (default: skyrimspecialedition)
-  --limit <n>       reqs, dependents: entries to return (default 50, at most 200)
-  --offset <n>      reqs, dependents: entries to skip (default 0)
+  --limit <n>       reqs, dependents, list-mods: entries to return (default 50, at most 200)
+  --offset <n>      reqs, dependents, list-mods: entries to skip (default 0)
   --help, --version
 
 API KEY
-  desc, changelog, files, archived-files, dl-file and file-note read your personal API key from the
+  Everything except permissions, reqs, dependents and list-mods reads your personal API key from the
   NEXUS_API_KEY environment variable (nexusmods.com > Site preferences > API Keys).
 
 EXIT CODES
@@ -195,7 +213,7 @@ Http send(const std::string& method, const std::string& url, const std::vector<s
         if (!WinHttpReadData(request.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &got))
             fail("the connection dropped (WinHTTP error " + std::to_string(GetLastError()) + ")");
         if (got == 0) break;
-        if (result.status == 200)
+        if (result.status >= 200 && result.status < 300)
             sink(buffer.data(), got);
         else if (result.error_body.size() < 4096)
             result.error_body.append(buffer.data(), got);
@@ -207,7 +225,7 @@ std::string api_error(int status, const std::string& body) {
     std::string detail;
     json j = json::parse(body, nullptr, false);
     if (j.is_object()) {
-        for (const char* k : {"message", "error"})
+        for (const char* k : {"error", "message", "title", "detail"})  // the last one found is the most specific
             if (j.contains(k) && j[k].is_string()) detail = j[k].get<std::string>();
     }
     switch (status) {
@@ -225,6 +243,19 @@ json v1_get(const std::string& path) {
                   "", [&](const char* p, size_t n) { text.append(p, n); });
     if (r.status != 200) fail(api_error(r.status, r.error_body));
     return json::parse(text);
+}
+
+// v3 is the API that can change things. Returns null for a response with no body.
+json v3_call(const std::string& method, const std::string& path, const json* body = nullptr) {
+    std::vector<std::string> headers = {"apikey: " + api_key(), "Accept: application/json",
+                                        std::string("Application-Name: ") + kToolName,
+                                        std::string("Application-Version: ") + kToolVersion};
+    if (body) headers.push_back("Content-Type: application/json");
+    std::string text;
+    Http r = send(method, std::string(kV3) + path, headers, body ? body->dump(-1, ' ', false, json::error_handler_t::replace) : "",
+                  [&](const char* p, size_t n) { text.append(p, n); });
+    if (r.status < 200 || r.status >= 300) fail(api_error(r.status, r.error_body));
+    return text.empty() ? json(nullptr) : json::parse(text);
 }
 
 json graphql(const std::string& query, const json& variables) {
@@ -269,19 +300,26 @@ std::string clean_text(const std::string& s) {
     static const std::map<std::string, char> named = {{"amp", '&'}, {"lt", '<'}, {"gt", '>'}, {"quot", '"'}, {"apos", '\''}};
     std::string out;
     out.reserve(s.size());
+    bool after_break = false;  // the last thing written was a <br />
     for (size_t i = 0; i < s.size();) {
         char c = s[i];
         if (c == '\r') {
             ++i;
-        } else if (c == '<' && lower(s.substr(i, 3)) == "<br") {
+            continue;
+        }
+        if (c == '<' && lower(s.substr(i, 3)) == "<br") {
             size_t end = s.find('>', i);
             if (end == std::string::npos) {
                 out += s.substr(i);
                 break;
             }
-            if (out.empty() || out.back() != '\n') out += '\n';
+            if (out.empty() || out.back() != '\n' || after_break) out += '\n';  // the site stores "\n<br />" for one break
+            after_break = true;
             i = end + 1;
-        } else if (c == '&') {
+            continue;
+        }
+        after_break = false;
+        if (c == '&') {
             size_t end = s.find(';', i);
             std::string name = end != std::string::npos && end - i <= 10 ? s.substr(i + 1, end - i - 1) : std::string();
             auto it = named.find(name);
@@ -617,6 +655,314 @@ json cmd_permissions(const Target& t) {
     return out;
 }
 
+// ---------------------------------------------------------------- local files
+
+std::string read_file(const fs::path& path) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) fail("cannot read " + path.u8string());
+    std::string out;
+    char buffer[65536];
+    size_t n;
+    while ((n = std::fread(buffer, 1, sizeof(buffer), f)) > 0) out.append(buffer, n);
+    bool failed = std::ferror(f) != 0;
+    std::fclose(f);
+    if (failed) fail("cannot read " + path.u8string());
+    return out;
+}
+
+// Reads the file back, so a backup that didn't really land is caught before anything is overwritten.
+void write_file(const fs::path& path, const std::string& data) {
+    if (path.has_parent_path()) fs::create_directories(path.parent_path());
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) fail("cannot write " + path.u8string());
+    size_t written = std::fwrite(data.data(), 1, data.size(), f);
+    bool failed = std::fclose(f) != 0 || written != data.size();
+    if (failed || read_file(path) != data) fail("cannot write " + path.u8string());
+}
+
+bool valid_utf8(const std::string& s) {
+    return s.empty() || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), nullptr, 0) > 0;
+}
+
+std::string utc_stamp() {
+    SYSTEMTIME t;
+    GetSystemTime(&t);
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%04d%02d%02d-%02d%02d%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    return buffer;
+}
+
+// Removes a UTF-8 BOM, turns every line ending into \n and drops trailing whitespace.
+std::string normalize_text(std::string s) {
+    if (s.rfind("\xEF\xBB\xBF", 0) == 0) s.erase(0, 3);
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\r') {
+            if (i + 1 < s.size() && s[i + 1] == '\n') continue;
+            out += '\n';
+        } else {
+            out += s[i];
+        }
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == ' ' || out.back() == '\t')) out.pop_back();
+    return out;
+}
+
+// The API escapes < and & in what it is sent, so HTML tags and entities would show up on the page as literal text.
+// Returns where the first one is, or "" if there are none.
+std::string html_problem(const std::string& s) {
+    static const std::set<std::string> tags = {"a", "b", "blockquote", "br", "center", "div", "em", "font", "h1", "h2", "h3", "h4",
+                                               "h5", "h6", "hr", "i", "img", "li", "ol", "p", "pre", "span", "strong", "table", "td",
+                                               "th", "tr", "u", "ul"};
+    static const std::set<std::string> entities = {"amp", "lt", "gt", "quot", "apos", "nbsp"};
+    int line = 1;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\n') ++line;
+        size_t end = 0;
+        bool found = false;
+        if (s[i] == '<') {
+            size_t j = i + 1;
+            if (j < s.size() && s[j] == '/') ++j;
+            size_t name = j;
+            while (j < s.size() && std::isalnum(static_cast<unsigned char>(s[j]))) ++j;
+            found = j < s.size() && (s[j] == '>' || s[j] == ' ' || s[j] == '/') && tags.count(lower(s.substr(name, j - name))) > 0;
+            end = s.find('>', j);
+        } else if (s[i] == '&') {
+            end = s.find(';', i);
+            if (end != std::string::npos && end - i <= 10) {
+                std::string name = lower(s.substr(i + 1, end - i - 1));
+                found = entities.count(name) > 0 ||
+                        (name.size() > 1 && name[0] == '#' && std::all_of(name.begin() + 1, name.end(), [](unsigned char c) { return std::isdigit(c); }));
+            }
+        }
+        if (found) return "line " + std::to_string(line) + ": " + s.substr(i, end == std::string::npos ? 20 : std::min<size_t>(end - i + 1, 40));
+    }
+    return {};
+}
+
+void check_no_html(const std::string& what, const std::string& text, bool allow) {
+    if (allow) return;
+    std::string problem = html_problem(text);
+    if (!problem.empty())
+        fail(what + " has HTML in it (" + problem + "). Nexus would show that as literal text. Use BBCode and plain line breaks, " +
+             "or pass --allow-html if it's meant to be shown literally");
+}
+
+// ---------------------------------------------------------------- changing a mod page
+
+json v3_mod(const Target& t) { return v3_call("GET", "/games/" + t.game + "/mods/" + t.mod)["data"]; }
+
+json cmd_save_desc(const Target& t, const std::string& dest, bool force) {
+    json mod = v3_mod(t);
+    fs::path target = to_wide(dest);
+    if (fs::is_directory(target) || dest.back() == '/' || dest.back() == '\\') target /= to_wide(t.mod + "-description.bbcode");
+    if (fs::exists(target) && !force) fail(target.u8string() + " already exists (--force replaces it)");
+    std::string text = clean_text(text_of(mod, "description"));
+    write_file(target, text);
+    json out = t.header();
+    out["name"] = value_of(mod, "name");
+    out["path"] = fs::absolute(target).u8string();
+    out["chars"] = text.size();
+    return out;
+}
+
+// Two files: the BBCode, which set-desc can restore, and the text exactly as the server stored it.
+json backup_description(const Target& t, const std::string& stored, const fs::path& folder) {
+    if (stored.empty()) fail("could not read the current description, so it can't be backed up; nothing was changed");
+    std::string base = t.mod + "-" + utc_stamp() + "-description";
+    fs::path bbcode = folder / to_wide(base + ".bbcode"), raw = folder / to_wide(base + ".raw.txt");
+    write_file(bbcode, clean_text(stored));
+    write_file(raw, stored);
+    return {{"bbcode", fs::absolute(bbcode).u8string()}, {"as_stored", fs::absolute(raw).u8string()}};
+}
+
+json cmd_set_desc(const Target& t, const std::string& file, std::string backup_dir, bool dry_run, bool allow_html) {
+    fs::path input = to_wide(file);
+    std::string raw_input = read_file(input);
+    if (!valid_utf8(raw_input)) fail(file + " isn't valid UTF-8; save it as UTF-8 first");
+    std::string text = normalize_text(raw_input);
+    if (text.empty()) fail(file + " is empty");
+    check_no_html(file, text, allow_html);
+
+    json mod = v3_mod(t);
+    std::string stored = text_of(mod, "description");
+    fs::path folder = backup_dir.empty() ? fs::absolute(input).parent_path() / L"nexus-api-tool-backups" : fs::path(to_wide(backup_dir));
+    json backup = backup_description(t, stored, folder);
+
+    json out = t.header();
+    out["name"] = value_of(mod, "name");
+    out["backup"] = backup;
+    out["chars"] = text.size();
+    if (normalize_text(clean_text(stored)) == text) {
+        out["changed"] = false;
+        out["message"] = "the page already has this text; nothing was sent";
+        return out;
+    }
+    if (dry_run) {
+        out["changed"] = false;
+        out["dry_run"] = true;
+        out["message"] = "backed up and checked; nothing was sent";
+        return out;
+    }
+    json body = {{"description", text}};
+    v3_call("PATCH", "/mods/" + text_of(mod, "id"), &body);
+    out["changed"] = true;
+
+    std::string after = normalize_text(clean_text(text_of(v3_mod(t), "description")));
+    out["verified"] = after == text;
+    if (after != text) fail("the page was changed but reads back differently from " + file + ". The old text is in " + backup["bbcode"].get<std::string>());
+    return out;
+}
+
+std::string md5_of(const std::string& data, bool hex) {
+    unsigned char hash[16];
+    if (BCryptHash(BCRYPT_MD5_ALG_HANDLE, nullptr, 0, reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())), static_cast<ULONG>(data.size()), hash, sizeof(hash)) != 0)
+        fail("could not hash the file");
+    if (hex) {
+        std::string out;
+        char piece[3];
+        for (unsigned char b : hash) {
+            std::snprintf(piece, sizeof(piece), "%02x", b);
+            out += piece;
+        }
+        return out;
+    }
+    DWORD size = 0;
+    CryptBinaryToStringA(hash, sizeof(hash), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &size);
+    std::string out(size, '\0');
+    CryptBinaryToStringA(hash, sizeof(hash), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, out.data(), &size);
+    out.resize(size);
+    return out;
+}
+
+struct UploadArgs {
+    std::string file, name, version, category, note, replaces, changelog;
+    bool set_mod_version = false, dry_run = false, allow_html = false;
+};
+
+bool all_in(const std::string& s, const char* punctuation) {
+    return std::all_of(s.begin(), s.end(), [&](unsigned char c) { return std::isalnum(c) || (c < 0x80 && std::strchr(punctuation, c)); });
+}
+
+json cmd_upload_file(const Target& t, const UploadArgs& a) {
+    // Everything the API would refuse is checked first, so a bad name never costs an upload.
+    if (a.name.empty() || a.name.size() > 50 || !all_in(a.name, " _'().-"))
+        fail("--name must be 1 to 50 characters: letters, digits, spaces and _ ' ( ) . -");
+    if (a.version.empty() || a.version.size() > 50 || !all_in(a.version, ".-"))
+        fail("--file-version must be 1 to 50 characters: letters, digits and . -");
+    if (!a.category.empty() && a.category != "main" && a.category != "optional" && a.category != "miscellaneous")
+        fail("--category must be main, optional or miscellaneous");
+    if (!valid_utf8(a.note) || !valid_utf8(a.changelog)) fail("--note and --changelog must be UTF-8");
+    check_no_html("--note", a.note, a.allow_html);
+    check_no_html("--changelog", a.changelog, a.allow_html);
+
+    fs::path path = to_wide(a.file);
+    if (!fs::is_regular_file(path)) fail(a.file + " isn't a file");
+    long long size = static_cast<long long>(fs::file_size(path));
+    if (size == 0) fail(a.file + " is empty");
+    if (size >= kMaxUploadBytes) fail(a.file + " is 100 MiB or larger; this tool only does the API's simple upload, which is limited to that");
+    std::string filename = path.filename().u8string();
+    if (filename.find('"') != std::string::npos || std::any_of(filename.begin(), filename.end(), [](unsigned char c) { return c >= 0x80; }))
+        fail("the file name has to be plain ASCII with no quotes: " + filename);
+
+    json mod = v3_mod(t);
+    std::string mod_uuid = text_of(mod, "id"), group, category = a.category;
+    if (!a.replaces.empty()) {
+        json old_file = v1_get(t.v1_mod() + "/files/" + a.replaces + ".json");  // 404s if it isn't this mod's file
+        group = text_of(v3_call("GET", "/games/" + t.game + "/mod-file-versions/" + a.replaces)["data"]["file"], "id");
+        if (group.empty()) fail("could not find the file group of file " + a.replaces);
+        if (category.empty()) {
+            std::string old_category = category_key(old_file.value("category_id", 0));
+            category = old_category == "optional" || old_category == "miscellaneous" ? old_category : "main";
+        }
+    }
+    if (category.empty()) category = "main";
+
+    json out = t.header();
+    out["mod_name"] = value_of(mod, "name");
+    out["file"] = filename;
+    out["bytes"] = size;
+    out["label"] = a.name;
+    out["version"] = a.version;
+    out["category"] = category;
+    out["replaces"] = a.replaces.empty() ? json(nullptr) : json(std::stoll(a.replaces));
+    if (a.dry_run) {
+        out["dry_run"] = true;
+        out["message"] = "checked; nothing was uploaded";
+        return out;
+    }
+
+    std::string data = read_file(path);
+    json request = {{"size_bytes", size}, {"filename", filename}, {"md5", md5_of(data, true)}};
+    json upload = v3_call("POST", "/uploads", &request)["data"];
+    std::string upload_id = text_of(upload, "id");
+    // The presigned URL signs these three headers, so they must be exactly this.
+    Http put = send("PUT", text_of(upload, "presigned_url"),
+                    {"Content-Disposition: attachment; filename=\"" + filename + "\"", "Content-MD5: " + md5_of(data, false),
+                     "Content-Type: application/octet-stream"},
+                    data, [](const char*, size_t) {});
+    if (put.status < 200 || put.status >= 300) fail("sending the file failed: HTTP " + std::to_string(put.status));
+    v3_call("POST", "/uploads/" + upload_id + "/finalise");
+    std::string state;
+    for (int tries = 0; tries < 90 && state != "available"; ++tries) {
+        Sleep(2000);
+        state = text_of(v3_call("GET", "/uploads/" + upload_id)["data"], "state");
+    }
+    if (state != "available") fail("Nexus never finished processing the upload (state: " + state + ")");
+
+    json file = {{"upload_id", upload_id}, {"name", a.name}, {"version", a.version}, {"file_category", category},
+                 {"show_requirements_pop_up", false}, {"allow_mod_manager_download", true}, {"update_mod_version", a.set_mod_version}};
+    if (!a.note.empty()) file["description"] = a.note;
+    json created;
+    if (a.replaces.empty()) {
+        file["mod_id"] = mod_uuid;
+        created = v3_call("POST", "/mod-files", &file);
+    } else {
+        file["archive_existing_file"] = true;
+        created = v3_call("POST", "/mod-files/" + group + "/versions", &file);
+    }
+    out["uploaded"] = true;
+    out["result"] = created.is_object() ? value_of(created, "data") : json(nullptr);
+    if (!a.changelog.empty()) {
+        json entry = {{"version", a.version}, {"changelog", a.changelog}};
+        v3_call("POST", "/mods/" + mod_uuid + "/changelogs", &entry);
+        out["changelog_added"] = true;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- list-mods
+
+json cmd_list_mods(const Target& t, const std::string& user) {
+    json found = graphql("query($n:String!){userByName(name:$n){memberId name}}", {{"n", user}})["userByName"];
+    if (!found.is_object()) fail("no Nexus user is called " + user);
+    json filter = {{"uploaderId", json::array({{{"value", std::to_string(found["memberId"].get<long long>())}, {"op", "EQUALS"}}})},
+                   {"gameDomainName", json::array({{{"value", t.game}, {"op", "EQUALS"}}})}};
+    const std::string query =
+        "query($f:ModsFilter,$o:Int,$c:Int){mods(filter:$f,offset:$o,count:$c,sort:[{createdAt:{direction:DESC}}]){totalCount "
+        "nodes{modId name version status adultContent createdAt updatedAt downloads endorsements author}}}";
+    json list = json::array();
+    int offset = t.offset, total = 0;
+    while (static_cast<int>(list.size()) < t.limit) {
+        json vars = {{"f", filter}, {"o", offset}, {"c", std::min(kPageSize, t.limit - static_cast<int>(list.size()))}};
+        json page = graphql(query, vars)["mods"];
+        total = page["totalCount"].get<int>();
+        for (const auto& n : page["nodes"])
+            list.push_back({{"mod_id", id_number(n["modId"])}, {"name", value_of(n, "name")}, {"version", value_of(n, "version")},
+                            {"author", value_of(n, "author")}, {"status", value_of(n, "status")}, {"adult", value_of(n, "adultContent")},
+                            {"created", value_of(n, "createdAt")}, {"updated", value_of(n, "updatedAt")},
+                            {"downloads", value_of(n, "downloads")}, {"endorsements", value_of(n, "endorsements")}});
+        offset += static_cast<int>(page["nodes"].size());
+        if (page["nodes"].empty() || offset >= total) break;
+    }
+    int end = t.offset + static_cast<int>(list.size());
+    json out = {{"user", value_of(found, "name")}, {"member_id", value_of(found, "memberId")}, {"game", t.game},
+                {"total", total}, {"offset", t.offset}, {"returned", list.size()},
+                {"next_offset", !list.empty() && end < total ? json(end) : json(nullptr)}, {"mods", list}};
+    return out;
+}
+
 // ---------------------------------------------------------------- command line
 
 bool all_digits(const std::string& s) {
@@ -629,11 +975,38 @@ bool valid_game(const std::string& s) {
 
 void print(const std::string& text) { std::fwrite(text.data(), 1, text.size(), stdout); }
 
+struct CommandSpec {
+    const char* name;
+    int positional;                 // arguments after the command
+    std::set<std::string> options;  // besides --game
+};
+
+const std::vector<CommandSpec>& command_specs() {
+    static const std::set<std::string> paged = {"--limit", "--offset"};
+    static const std::vector<CommandSpec> specs = {
+        {"desc", 1, {}},
+        {"changelog", 1, {}},
+        {"files", 1, {}},
+        {"archived-files", 1, {}},
+        {"dl-file", 2, {"--dest", "--force"}},
+        {"file-note", 2, {}},
+        {"permissions", 1, {}},
+        {"reqs", 1, paged},
+        {"dependents", 1, paged},
+        {"list-mods", 1, paged},
+        {"save-desc", 1, {"--dest", "--force"}},
+        {"set-desc", 1, {"--file", "--backup-dir", "--dry-run", "--allow-html"}},
+        {"upload-file", 1, {"--file", "--name", "--file-version", "--replaces", "--category", "--note", "--changelog", "--set-mod-version", "--dry-run", "--allow-html"}},
+    };
+    return specs;
+}
+
 int run(const std::vector<std::string>& args) {
+    static const std::set<std::string> with_value = {"--game", "--dest", "--limit", "--offset", "--file", "--backup-dir", "--name",
+                                                     "--file-version", "--replaces", "--category", "--note", "--changelog"};
+    static const std::set<std::string> flags = {"--force", "--dry-run", "--allow-html", "--set-mod-version"};
     std::vector<std::string> positional;
-    std::string game = kDefaultGame, dest;
-    bool has_dest = false, force = false;
-    std::string limit_text, offset_text;
+    std::map<std::string, std::string> options;
     for (size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         if (a == "--help" || a == "-h" || a == "help") {
@@ -644,12 +1017,11 @@ int run(const std::vector<std::string>& args) {
             print(std::string(kToolName) + " " + kToolVersion + "\n");
             return 0;
         }
-        if (a == "--game" || a == "--dest" || a == "--limit" || a == "--offset") {
+        if (with_value.count(a)) {
             if (i + 1 >= args.size()) bad_args(a + " needs a value");
-            (a == "--game" ? game : a == "--dest" ? dest : a == "--limit" ? limit_text : offset_text) = args[++i];
-            if (a == "--dest") has_dest = true;
-        } else if (a == "--force") {
-            force = true;
+            options[a] = args[++i];
+        } else if (flags.count(a)) {
+            options[a] = "1";
         } else if (a.rfind("--", 0) == 0) {
             bad_args("unknown option " + a);
         } else {
@@ -660,39 +1032,69 @@ int run(const std::vector<std::string>& args) {
         print(kUsage);
         return 2;
     }
+    auto has = [&](const char* k) { return options.count(k) > 0; };
+    auto option = [&](const char* k) { return has(k) ? options[k] : std::string(); };
+    std::string game = has("--game") ? options["--game"] : kDefaultGame;
     if (!valid_game(game)) bad_args("bad game domain " + game);
 
     const std::string& command = positional[0];
-    bool takes_file = command == "dl-file" || command == "file-note";
-    static const char* commands[] = {"desc", "changelog", "files", "archived-files", "dl-file", "file-note", "permissions", "reqs", "dependents"};
-    if (std::none_of(std::begin(commands), std::end(commands), [&](const char* c) { return command == c; }))
-        bad_args("unknown command " + command);
-    if (positional.size() != (takes_file ? 3u : 2u))
-        bad_args(command + (takes_file ? " needs a mod id and a file number" : " needs a mod id"));
-    if (!all_digits(positional[1])) bad_args("the mod id must be a number");
-    if (takes_file && !all_digits(positional[2])) bad_args("the file number must be a number");
-    if (command == "dl-file" && (!has_dest || dest.empty())) bad_args("dl-file needs --dest <path>");
-
-    Target t{game, positional[1]};
-    if (!limit_text.empty() || !offset_text.empty()) {
-        if (command != "reqs" && command != "dependents") bad_args("--limit and --offset only apply to reqs and dependents");
-        if (!limit_text.empty() && (!all_digits(limit_text) || limit_text.size() > 9)) bad_args("--limit must be a number");
-        if (!offset_text.empty() && (!all_digits(offset_text) || offset_text.size() > 9)) bad_args("--offset must be a number");
-        if (!offset_text.empty()) t.offset = std::stoi(offset_text);
-        if (!limit_text.empty()) t.limit = std::stoi(limit_text);
-        if (t.limit < 1 || t.limit > kMaxLimit)
-            bad_args("--limit must be 1 to " + std::to_string(kMaxLimit) + "; use --offset to read further");
+    const auto& specs = command_specs();
+    auto spec = std::find_if(specs.begin(), specs.end(), [&](const CommandSpec& c) { return command == c.name; });
+    if (spec == specs.end()) bad_args("unknown command " + command);
+    for (const auto& kv : options) {
+        if (kv.first != "--game" && !spec->options.count(kv.first)) {
+            if (kv.first == "--limit" || kv.first == "--offset") bad_args("--limit and --offset only apply to reqs, dependents and list-mods");
+            bad_args(kv.first + " doesn't apply to " + command);
+        }
     }
+
+    bool lists_user = command == "list-mods";
+    bool takes_file = spec->positional == 2;
+    if (static_cast<int>(positional.size()) != spec->positional + 1)
+        bad_args(command + (lists_user ? " needs a user name" : takes_file ? " needs a mod id and a file number" : " needs a mod id"));
+    if (!lists_user && !all_digits(positional[1])) bad_args("the mod id must be a number");
+    if (takes_file && !all_digits(positional[2])) bad_args("the file number must be a number");
+    if ((command == "dl-file" || command == "save-desc") && option("--dest").empty()) bad_args(command + " needs --dest <path>");
+    if ((command == "set-desc" || command == "upload-file") && option("--file").empty()) bad_args(command + " needs --file <path>");
+    if (command == "upload-file" && (option("--name").empty() || option("--file-version").empty())) bad_args("upload-file needs --name and --file-version");
+    if (has("--replaces") && !all_digits(option("--replaces"))) bad_args("--replaces must be a file number");
+
+    Target t{game, lists_user ? std::string("0") : positional[1]};
+    std::string limit_text = option("--limit"), offset_text = option("--offset");
+    if (!limit_text.empty() && (!all_digits(limit_text) || limit_text.size() > 9)) bad_args("--limit must be a number");
+    if (!offset_text.empty() && (!all_digits(offset_text) || offset_text.size() > 9)) bad_args("--offset must be a number");
+    if (!offset_text.empty()) t.offset = std::stoi(offset_text);
+    if (!limit_text.empty()) t.limit = std::stoi(limit_text);
+    if (t.limit < 1 || t.limit > kMaxLimit)
+        bad_args("--limit must be 1 to " + std::to_string(kMaxLimit) + "; use --offset to read further");
+
     json result;
     if (command == "desc") result = cmd_desc(t);
     else if (command == "changelog") result = cmd_changelog(t);
     else if (command == "files") result = cmd_files(t, false);
     else if (command == "archived-files") result = cmd_files(t, true);
-    else if (command == "dl-file") result = cmd_dl_file(t, positional[2], dest, force);
+    else if (command == "dl-file") result = cmd_dl_file(t, positional[2], option("--dest"), has("--force"));
     else if (command == "file-note") result = cmd_file_note(t, positional[2]);
     else if (command == "permissions") result = cmd_permissions(t);
     else if (command == "reqs") result = cmd_reqs(t);
-    else result = cmd_dependents(t);
+    else if (command == "dependents") result = cmd_dependents(t);
+    else if (command == "list-mods") result = cmd_list_mods(t, positional[1]);
+    else if (command == "save-desc") result = cmd_save_desc(t, option("--dest"), has("--force"));
+    else if (command == "set-desc") result = cmd_set_desc(t, option("--file"), option("--backup-dir"), has("--dry-run"), has("--allow-html"));
+    else {
+        UploadArgs a;
+        a.file = option("--file");
+        a.name = option("--name");
+        a.version = option("--file-version");
+        a.category = option("--category");
+        a.note = option("--note");
+        a.replaces = option("--replaces");
+        a.changelog = option("--changelog");
+        a.set_mod_version = has("--set-mod-version");
+        a.dry_run = has("--dry-run");
+        a.allow_html = has("--allow-html");
+        result = cmd_upload_file(t, a);
+    }
 
     print(result.dump(2, ' ', false, json::error_handler_t::replace) + "\n");
     return 0;
