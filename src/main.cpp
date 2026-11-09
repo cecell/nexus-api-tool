@@ -33,7 +33,7 @@ constexpr const wchar_t* kKeyEnvVar = L"NEXUS_API_KEY";
 constexpr const char* kKeyEnvVarText = "NEXUS_API_KEY";
 
 constexpr const char* kToolName = "nexus-api-tool";
-constexpr const char* kToolVersion = "0.1.0";
+constexpr const char* kToolVersion = APP_VERSION;  // from CMakeLists.txt
 constexpr const char* kDefaultGame = "skyrimspecialedition";
 constexpr const char* kV1 = "https://api.nexusmods.com/v1";
 constexpr const char* kGraphQl = "https://api.nexusmods.com/v2/graphql";

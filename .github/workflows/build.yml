@@ -1,0 +1,37 @@
+# Builds nexus-api-tool.exe and runs the command-line tests on a clean runner, with the same MSVC
+# toolset as local builds. The tests need neither the network nor an API key.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    env:
+      MSVC_TOOLSET: "14.44"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build and test
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=%MSVC_TOOLSET% || exit /b 1
+          cl 2>&1 | findstr /C:"Version"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=%VCPKG_INSTALLATION_ROOT%\scripts\buildsystems\vcpkg.cmake" || exit /b 1
+          cmake --build build || exit /b 1
+          ctest --test-dir build --output-on-failure || exit /b 1
+          build\nexus-api-tool.exe --help > nul || exit /b 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-api-tool
+          path: build/nexus-api-tool.exe

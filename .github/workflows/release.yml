@@ -1,0 +1,180 @@
+# Build to GitHub release in one run.
+#
+#   git tag v0.2.0 && git push origin v0.2.0   build, test, package, hash, scan, publish the GitHub release
+#   Actions > Release > Run workflow           the same, stopping before anything is published
+#
+# The tag must match the version in CMakeLists.txt, and release_notes/<version>.md must exist. A retry
+# skips what already exists.
+#
+# The files released are the ones this run built and hashed, unchanged. A VirusTotal detection doesn't
+# stop the release, because unsigned exes draw machine-learning false positives; the results go in the
+# release notes and the run summary.
+#
+# Secret: VIRUSTOTAL_API_KEY.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write       # create the release
+  id-token: write       # sign the build provenance
+  attestations: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2025
+    env:
+      MSVC_TOOLSET: "14.44"
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the version and the release notes
+        id: version
+        shell: pwsh
+        run: |
+          $m = Select-String -Path CMakeLists.txt -Pattern 'project\(nexus_api_tool VERSION ([0-9.]+)'
+          if (-not $m) { throw 'No version in CMakeLists.txt' }
+          $version = $m.Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME doesn't match version $version in CMakeLists.txt"
+          }
+          if (-not (Test-Path "release_notes/$version.md")) { throw "release_notes/$version.md is missing" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build and test
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=%MSVC_TOOLSET% || exit /b 1
+          cl 2>&1 | findstr /C:"Version"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=%VCPKG_INSTALLATION_ROOT%\scripts\buildsystems\vcpkg.cmake" || exit /b 1
+          cmake --build build || exit /b 1
+          ctest --test-dir build --output-on-failure || exit /b 1
+          build\nexus-api-tool.exe --version || exit /b 1
+
+      - name: Package and hash
+        id: package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $stage = New-Item -ItemType Directory -Force "stage/nexus-api-tool-$env:VERSION"
+          Copy-Item build\nexus-api-tool.exe, README.md, LICENSE, THIRD_PARTY_NOTICES.md $stage
+          $dist = New-Item -ItemType Directory -Force dist
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/nexus-api-tool-$env:VERSION.zip"
+          Copy-Item build\nexus-api-tool.exe $dist
+          $lines = Get-ChildItem $dist -File | Sort-Object Name | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          }
+          # LF line endings, so "sha256sum -c SHA256SUMS.txt" works anywhere.
+          [IO.File]::WriteAllText("$PWD\dist\SHA256SUMS.txt", ($lines -join "`n") + "`n")
+          '## SHA-256', '```', $lines, '```', "Commit: $env:GITHUB_SHA" | ForEach-Object { $_ >> $env:GITHUB_STEP_SUMMARY }
+
+      - name: Attest build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/nexus-api-tool.exe
+            dist/nexus-api-tool-*.zip
+
+      - name: VirusTotal scan
+        id: scan
+        continue-on-error: true
+        shell: pwsh
+        env:
+          VT_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          $md = @('| File | SHA-256 | VirusTotal |', '|---|---|---|')
+          if (-not $env:VT_KEY) {
+            foreach ($f in Get-ChildItem dist -File | Where-Object Extension -in '.exe', '.zip' | Sort-Object Name) {
+              $md += "| ``$($f.Name)`` | ``$((Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower())`` | not scanned |"
+            }
+            $md -join "`n" | Set-Content -Encoding utf8 vt-report.md
+            'VirusTotal: no API key, skipped.' >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          $headers = @{ 'x-apikey' = $env:VT_KEY.Trim() }
+          $api = 'https://www.virustotal.com/api/v3'
+          $files = Get-ChildItem dist -File | Where-Object Extension -in '.exe', '.zip' | Sort-Object Name
+          $scans = foreach ($f in $files) {
+            $id = (Invoke-RestMethod -Method Post "$api/files" -Headers $headers -Form @{ file = $f }).data.id
+            [pscustomobject]@{ File = $f.Name; Sha = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower(); Id = $id; Analysis = $null }
+          }
+          # Wait for each analysis (up to 20 minutes in all).
+          $deadline = (Get-Date).AddMinutes(20)
+          while (($scans | Where-Object { -not $_.Analysis }) -and (Get-Date) -lt $deadline) {
+            Start-Sleep 30
+            foreach ($s in $scans | Where-Object { -not $_.Analysis }) {
+              $a = (Invoke-RestMethod "$api/analyses/$($s.Id)" -Headers $headers).data.attributes
+              if ($a.status -eq 'completed') { $s.Analysis = $a }
+            }
+          }
+          $details = @()
+          foreach ($s in $scans) {
+            $link = "https://www.virustotal.com/gui/file/$($s.Sha)"
+            if (-not $s.Analysis) { $md += "| ``$($s.File)`` | ``$($s.Sha)`` | [still running]($link) |"; continue }
+            $st = $s.Analysis.stats
+            $flagged = $st.malicious + $st.suspicious
+            $total = $st.malicious + $st.suspicious + $st.undetected + $st.harmless
+            $md += "| ``$($s.File)`` | ``$($s.Sha)`` | [$flagged of $total flagged]($link) |"
+            $hits = $s.Analysis.results.PSObject.Properties.Value | Where-Object { $_.category -in 'malicious', 'suspicious' }
+            foreach ($h in $hits | Sort-Object engine_name) { $details += "- ``$($s.File)``: $($h.engine_name): $($h.result)" }
+          }
+          if ($details) { $md += '', 'Detections:', ''; $md += $details }
+          $md -join "`n" | Set-Content -Encoding utf8 vt-report.md
+          '## VirusTotal', ($md -join "`n") | ForEach-Object { $_ >> $env:GITHUB_STEP_SUMMARY }
+
+      - name: Write the release notes
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $notes = Get-Content -Raw "release_notes/$env:VERSION.md"
+          $verify = "## Verification`n`n"
+          if (Test-Path vt-report.md) { $verify += (Get-Content -Raw vt-report.md) + "`n`n" }
+          $verify += "Built by GitHub Actions from commit $env:GITHUB_SHA ([run](https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID)), and attached here unchanged.`n"
+          [IO.File]::WriteAllText("$PWD\dist-notes.md", $notes.TrimEnd() + "`n`n" + $verify)
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release
+          if-no-files-found: error
+          path: |
+            dist/
+            dist-notes.md
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: release
+
+      - name: Check the hashes
+        run: cd dist && sha256sum -c SHA256SUMS.txt
+
+      - name: Publish the GitHub release
+        if: ${{ github.ref_type == 'tag' }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists; left as it is." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            gh release create "v$VERSION" --verify-tag --title "Nexus API Tool $VERSION" --notes-file dist-notes.md --latest dist/*
+          fi
