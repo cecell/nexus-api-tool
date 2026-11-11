@@ -2,7 +2,15 @@
 A tool to help our friends help us!
 
 A small Windows command-line program that reads a Nexus Mods page and prints it as JSON (UTF-8). Made to be easy for
-scripts and AI agents to call. It only reads; the one thing it writes is the file you ask `dl-file` to download.
+scripts and AI agents to call.
+
+Most commands only read. These ones write something:
+
+- `dl-file` and `save-desc` save a file on your PC, where `--dest` says.
+- `set-desc` replaces a mod page's description, after saving a backup of the current one on your PC.
+- `upload-file` adds a file to a mod page.
+
+`set-desc` and `upload-file` change the mod page straight away, so try them with `--dry-run` first.
 
 ## Setup
 
