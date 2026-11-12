@@ -5,7 +5,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "")
 
 # The one place for the version: the exe and the release workflow both read it from here.
-project(nexus_api_tool VERSION 0.3.0 LANGUAGES CXX)
+project(nexus_api_tool VERSION 0.5.0 LANGUAGES CXX)
 
 find_package(nlohmann_json CONFIG REQUIRED)
 
@@ -36,3 +36,17 @@ add_cli_test(option_wrong_command "--file doesn't apply to desc" desc 266 --file
 add_cli_test(list_mods_needs_user "list-mods needs a user name" list-mods)
 add_cli_test(permissions_bad_address "must be a number or a mod page" permissions https://example.com/x)
 add_cli_test(permissions_saved_page "You must get permission from me" permissions 1 --html ${CMAKE_CURRENT_SOURCE_DIR}/tests/permissions_sample.html)
+add_cli_test(help_rate_limits "Cloudflare may impose a limit of 4/hour" --help)
+add_cli_test(help_verbose "CALLS PER RUN" --help --verbose)
+add_cli_test(usage_report "Upload limits are handled by Cloudflare" --usage)
+add_cli_test(usage_alias_limit "\"window\": \"last hour\"" --limit)
+add_cli_test(usage_per_minute "\"window\": \"last minute\"" --rates --per min)
+add_cli_test(usage_per_bad "--per takes s, sec, second" --usage --per week)
+add_cli_test(usage_no_command "runs on its own, without a command" desc 266 --usage)
+add_cli_test(interval_bad "--interval must be a number of seconds" desc 266 --interval -1)
+add_cli_test(verbose_wrong_place "--verbose goes with --help or --usage" desc 266 --verbose)
+add_cli_test(list_not_for_writes "doesn't run from --list" set-desc 266 --list x.txt --file y.txt)
+add_cli_test(max_size_bad "--max-size must be a number of bytes" dl-file 790 937 --dest . --max-size 5XB)
+add_cli_test(contents_needs_file "contents needs a mod id and a file number" contents 266)
+add_cli_test(search_needs_filter "search-files needs --ext or --name" search-files)
+add_cli_test(search_bad_range "--mod-range must look like 1000-2000" search-files --ext esp --mod-range 5)
