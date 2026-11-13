@@ -61,11 +61,12 @@ USAGE
 
 COMMANDS                                                                                  API USED
   desc <mod>                          name, author, version, summary and description      v1
-  changelog <mod>                     the changelog, per version                          v1
+                                      (BBCode as stored; --plain gives readable text)
+  changelog <mod>                     the changelog, per version (--plain)                v1
   files <mod>                         every file that isn't archived, grouped by category GraphQL
                                       (main, update, optional, miscellaneous, old)
   archived-files <mod>                the same for archived and removed files             GraphQL
-  file-note <mod> <file#>             the note on one file                                GraphQL
+  file-note <mod> <file#>             the note on one file (--plain)                      GraphQL
   contents <mod> <file#>              the files inside one archive, its plugins and BSAs  GraphQL (v1 + content
                                                                                           preview if not indexed)
   dl-file <mod> <file#> --dest <path> download one file; <path> is a folder or a file name v1 + file download
@@ -103,6 +104,10 @@ OPTIONS
                       commas; # starts a comment. For desc, changelog, files, archived-files, file-note,
                       contents, dl-file, reqs, dependents, list-mods and save-desc. Prints one JSON
                       object per line, and stops at the first rate limit.
+  --plain             desc, changelog, file-note: readable text instead of BBCode. Links become
+                      text (url), list items - item, headings and spoiler titles their own lines;
+                      images are dropped, videos become [video: url], invisible characters (byte-order
+                      marks, zero-width spaces) are removed and runs of blank lines collapse to one
   --interval <s>      seconds between two requests of the same kind, instead of the built-in pacing
                       (0 = no pause). Applies to every kind this run makes.
   --usage             (also --rate, --rates, --limits, or --limit with no command) report the requests
@@ -758,6 +763,115 @@ std::string strip_bbcode(const std::string& s) {
     return out;
 }
 
+// --plain: BBCode (after clean_text) as readable text. Only known tag names count as tags, so "[WIP]" or "[SSE]"
+// in the text stays. Links become "text (url)", list items "- item", headings and spoiler titles their own lines,
+// images are dropped, videos become "[video: url]", byte-order marks and zero-width characters are removed.
+std::string plain_text(const std::string& s) {
+    static const std::set<std::string> known = {
+        "b", "i", "u", "s", "size", "color", "colour", "font", "center", "centre", "left", "right", "justify", "align",
+        "quote", "code", "spoiler", "heading", "line", "hr", "list", "ul", "ol", "*", "li", "url", "email", "img",
+        "youtube", "video", "table", "tr", "td", "th", "sup", "sub", "indent", "highlight", "style", "strike"};
+    static const std::set<std::string> blocks = {"center", "centre", "left", "right", "justify", "align", "quote", "code",
+                                                 "heading", "table", "tr", "indent"};
+    auto newline = [](std::string& out) {
+        if (!out.empty() && out.back() != '\n') out += '\n';
+    };
+    std::string out;
+    std::vector<std::pair<size_t, std::string>> links;  // where each open [url] began in out, and its address
+    for (size_t i = 0; i < s.size();) {
+        if (s[i] != '[') {
+            out += s[i++];
+            continue;
+        }
+        size_t end = s.find(']', i);
+        if (end == std::string::npos) {
+            out += s.substr(i);
+            break;
+        }
+        std::string inner = s.substr(i + 1, end - i - 1);
+        bool closing = !inner.empty() && inner[0] == '/';
+        if (closing) inner.erase(0, 1);
+        size_t eq = inner.find('=');
+        std::string name = lower(inner.substr(0, std::min(eq, inner.find(' '))));
+        std::string arg = eq == std::string::npos ? std::string() : inner.substr(eq + 1);
+        if (arg.size() >= 2 && (arg.front() == '"' || arg.front() == '\'') && arg.back() == arg.front()) arg = arg.substr(1, arg.size() - 2);
+        if (!known.count(name)) {
+            out += s[i++];
+            continue;
+        }
+        i = end + 1;
+        auto content_until_close = [&](const std::string& tag) {  // the raw text up to [/tag]; skips past it
+            std::string rest = lower(s.substr(i));
+            size_t close = rest.find("[/" + tag + "]");
+            std::string content = close == std::string::npos ? s.substr(i) : s.substr(i, close);
+            i = close == std::string::npos ? s.size() : i + close + tag.size() + 3;
+            return content;
+        };
+        if (!closing && name == "img") {
+            content_until_close("img");
+        } else if (!closing && (name == "youtube" || name == "video")) {
+            std::string id = content_until_close(name);
+            while (!id.empty() && std::isspace(static_cast<unsigned char>(id.back()))) id.pop_back();
+            while (!id.empty() && std::isspace(static_cast<unsigned char>(id.front()))) id.erase(0, 1);
+            if (!id.empty())
+                out += "[video: " + (id.find("://") == std::string::npos ? "https://www.youtube.com/watch?v=" + id : id) + "]";
+        } else if (name == "url" || name == "email") {
+            if (!closing) {
+                links.push_back({out.size(), arg});
+            } else if (!links.empty()) {
+                auto [start, address] = links.back();
+                links.pop_back();
+                std::string text = out.substr(start);
+                out.resize(start);
+                std::string trimmed = text;
+                while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.back()))) trimmed.pop_back();
+                while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.front()))) trimmed.erase(0, 1);
+                if (address.empty() || trimmed == address) out += text;
+                else if (trimmed.empty()) out += address;
+                else out += trimmed + " (" + address + ")";
+            }
+        } else if (name == "*" || name == "li") {
+            if (!closing) {
+                newline(out);
+                out += "- ";
+            }
+        } else if (name == "list" || name == "ul" || name == "ol") {
+            newline(out);
+        } else if (name == "line" || name == "hr") {
+            newline(out);
+            out += '\n';
+        } else if (name == "spoiler") {
+            newline(out);
+            if (!closing && !arg.empty()) out += arg + "\n";
+        } else if (name == "td" || name == "th") {
+            if (closing) out += "  ";
+        } else if (blocks.count(name)) {
+            newline(out);
+        }
+    }
+    // Byte-order marks, zero-width spaces and joiners, word joiners: invisible, and they trip some consoles.
+    for (const char* junk : {"\xEF\xBB\xBF", "\xE2\x80\x8B", "\xE2\x80\x8C", "\xE2\x80\x8D", "\xE2\x81\xA0"})
+        for (size_t p; (p = out.find(junk)) != std::string::npos;) out.erase(p, std::strlen(junk));
+    // Trailing spaces on each line, at most one blank line in a row, no blank lines at the start or end.
+    std::string tidy;
+    size_t blank = 0;
+    for (size_t start = 0; start <= out.size();) {
+        size_t nl = out.find('\n', start);
+        std::string line = out.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
+        if (line.empty()) {
+            ++blank;
+        } else {
+            if (!tidy.empty()) tidy += blank > 0 ? "\n\n" : "\n";
+            tidy += line;
+            blank = 0;
+        }
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+    return tidy;
+}
+
 // ---------------------------------------------------------------- commands
 
 std::string read_file(const fs::path& path);
@@ -839,7 +953,8 @@ json mod_files(const Target& t) {
     return files;
 }
 
-json cmd_desc(const Target& t) {
+json cmd_desc(const Target& t, bool plain) {
+    auto text = [&](const std::string& s) { return plain ? plain_text(clean_text(s)) : clean_text(s); };
     json m = v1_get(t.v1_mod() + ".json");
     json out = t.header();
     out["name"] = value_of(m, "name");
@@ -848,19 +963,19 @@ json cmd_desc(const Target& t) {
     out["version"] = value_of(m, "version");
     out["status"] = value_of(m, "status");
     out["updated"] = value_of(m, "updated_time");
-    out["summary"] = clean_text(text_of(m, "summary"));
-    out["description"] = clean_text(text_of(m, "description"));
+    out["summary"] = text(text_of(m, "summary"));
+    out["description"] = text(text_of(m, "description"));
     return out;
 }
 
-json cmd_changelog(const Target& t) {
+json cmd_changelog(const Target& t, bool plain) {
     json log = v1_get(t.v1_mod() + "/changelogs.json");
     json versions = json::array();
     if (log.is_object()) {
         for (auto& [version, entries] : log.items()) {
             json lines = json::array();
             for (const auto& e : entries)
-                if (e.is_string()) lines.push_back(clean_text(e.get<std::string>()));
+                if (e.is_string()) lines.push_back(plain ? plain_text(clean_text(e.get<std::string>())) : clean_text(e.get<std::string>()));
             versions.push_back({{"version", version}, {"entries", lines}});
         }
     }
@@ -898,13 +1013,14 @@ json cmd_files(const Target& t, bool archived) {
     return out;
 }
 
-json cmd_file_note(const Target& t, const std::string& file) {
+json cmd_file_note(const Target& t, const std::string& file, bool plain) {
     json files = mod_files(t);
     auto f = std::find_if(files.begin(), files.end(), [&](const json& x) { return x.value("fileId", 0LL) == std::stoll(file); });
     if (f == files.end()) fail("mod " + t.mod + " has no file " + file);
     json o = file_object(*f);
     json out = t.header();
     for (const char* k : {"file_id", "label", "version", "category", "uploaded", "note"}) out[k] = o[k];
+    if (plain) out["note"] = plain_text(o["note"].get<std::string>());
     return out;
 }
 
@@ -1856,12 +1972,12 @@ const std::vector<CommandSpec>& command_specs() {
     static const std::set<std::string> paged = {"--limit", "--offset"};
     static const std::vector<CommandSpec> specs = {
         {"search-files", 0, {"--ext", "--mod-range", "--name", "--max-results"}, false},
-        {"desc", 1, {}, true},
-        {"changelog", 1, {}, true},
+        {"desc", 1, {"--plain"}, true},
+        {"changelog", 1, {"--plain"}, true},
         {"files", 1, {}, true},
         {"archived-files", 1, {}, true},
         {"dl-file", 2, {"--dest", "--force", "--skip-existing", "--max-size"}, true},
-        {"file-note", 2, {}, true},
+        {"file-note", 2, {"--plain"}, true},
         {"contents", 2, {}, true},
         {"permissions", 1, {"--html"}, false},
         {"reqs", 1, paged, true},
@@ -1956,8 +2072,8 @@ json run_one(const CommandSpec& spec, const std::vector<std::string>& positional
     if (!limit_text.empty()) t.limit = std::stoi(limit_text);
     if (t.limit < 1 || t.limit > kMaxLimit) bad_args("--limit must be 1 to " + std::to_string(kMaxLimit) + "; use --offset to read further");
 
-    if (command == "desc") return cmd_desc(t);
-    if (command == "changelog") return cmd_changelog(t);
+    if (command == "desc") return cmd_desc(t, has("--plain"));
+    if (command == "changelog") return cmd_changelog(t, has("--plain"));
     if (command == "files") return cmd_files(t, false);
     if (command == "archived-files") return cmd_files(t, true);
     if (command == "dl-file") {
@@ -1968,7 +2084,7 @@ json run_one(const CommandSpec& spec, const std::vector<std::string>& positional
         if (has("--max-size")) o.max_size = parse_size(option("--max-size"));
         return cmd_dl_file(t, positional[2], o);
     }
-    if (command == "file-note") return cmd_file_note(t, positional[2]);
+    if (command == "file-note") return cmd_file_note(t, positional[2], has("--plain"));
     if (command == "contents") return cmd_contents(t, positional[2]);
     if (command == "permissions") return cmd_permissions(t, option("--html"));
     if (command == "reqs") return cmd_reqs(t);
@@ -2054,7 +2170,7 @@ int run(const std::vector<std::string>& args) {
     static const std::set<std::string> with_value = {"--game", "--dest", "--offset", "--file", "--backup-dir", "--name", "--file-version", "--replaces",
                                                      "--category", "--note", "--changelog", "--list", "--interval", "--max-size", "--per", "--html", "--ext", "--mod-range", "--max-results"};
     static const std::set<std::string> flags = {"--force", "--dry-run", "--allow-html", "--set-mod-version", "--skip-existing", "--verbose",
-                                                "--rate", "--rates", "--limits", "--usage"};
+                                                "--rate", "--rates", "--limits", "--usage", "--plain"};
     std::vector<std::string> positional;
     std::map<std::string, std::string> options;
     bool help = false, limit_flag = false;

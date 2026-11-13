@@ -60,6 +60,11 @@ Each file has `file_id`, `label`, `version`, `category`, `uploaded`, `uploaded_t
 where Nexus doesn't report it in the file list. These three commands also work on unpublished mods; `desc` and `changelog`
 don't, because only the older API offers them and it refuses those mods.
 
+`desc`, `changelog` and `file-note` return the text as Nexus stores it (BBCode), which is what `save-desc` and
+`set-desc` round-trip. `--plain` returns readable text instead: links as `text (url)`, list items as `- item`, headings
+and spoiler titles on their own lines, images dropped, videos as `[video: url]`, byte-order marks and zero-width
+characters removed, and runs of blank lines collapsed to one. Bracketed text that isn't a BBCode tag (`[WIP]`) stays.
+
 `--dest` is a folder (it must exist, or end in `\`) or a file name. An existing file is only replaced with `--force`;
 `--skip-existing` leaves it and reports the item as skipped. `--max-size <size>` (bytes, or `500KB`, `200MB`, `2GB`) skips
 bigger files before anything is downloaded. The download is written to `<name>.part` and renamed once its size has been
