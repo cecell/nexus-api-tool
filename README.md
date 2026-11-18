@@ -137,6 +137,82 @@ The text file is plain BBCode in UTF-8, with ordinary line breaks. `set-desc`:
 
 `--dry-run` does the check and the backup and stops. The page's summary isn't touched.
 
+### Description projects: a page kept as sections
+
+A mod's description can be kept as a folder of BBCode files, one per section, and built into the page from there.
+Change one section without touching the rest, reuse blocks across mods, and start new pages from templates.
+
+**Where they live.** Set the projects folder once:
+
+```
+nexus-api-tool settings --projects-root D:\Modding\Descriptions
+```
+
+It's stored in `nexus-api-tool-settings.json` beside the exe. Every `desc-` command also takes `--root <folder>` instead.
+A mod's project is `<projects root>\<game>\<mod id>\`: `page.json` and one `.bbcode` file per part.
+
+**Section markers.** Each section's heading line starts with an empty link to an anchor:
+
+```
+[url=#nat-s-install][/url][size=5][b]Installation[/b][/size]
+[url=#nat-ss-install-manual][/url][size=4][b]Manual install[/b][/size]
+```
+
+`nat-s-<section>` starts a section, `nat-ss-<section>-<subsection>` a subsection of it. Ids are 1-40 characters of
+a-z, 0-9 and `_`. The marker shows nothing on the page, carries the id, and stays in place when the page is edited
+on the site (other empty tags are removed by the site's editor; unknown tags show as text). Text before the first
+marker is the `preamble`.
+
+**page.json**
+
+```json
+{
+  "mod_id": 12345, "game": "skyrimspecialedition", "template": "standard",
+  "vars": {"name": "My Mod", "author": "me"},
+  "heading": {"section": "[size=5][b]{{title}}[/b][/size]", "subsection": "[size=4][b]{{title}}[/b][/size]"},
+  "preamble": "preamble.bbcode",
+  "sections": [
+    {"id": "intro", "title": "About {{name}}", "file": "intro.bbcode",
+     "subsections": [{"id": "install", "title": "Installation", "file": "intro.install.bbcode"}]},
+    {"id": "credits", "title": "Credits", "file": "credits.bbcode"}
+  ]
+}
+```
+
+A section's heading is built from the `heading` style and its `title`; a section with its own `"heading"` keeps that
+text exactly (`desc-init` and `desc-pull` write headings that way, so a page reads back unchanged).
+
+**Templates.** `<projects root>\templates\<name>\` has the same layout as a project, plus an optional
+`"description"` in its page.json and a `partials\` folder. `<projects root>\templates\_shared\` holds partials for
+every template. In any section file, heading or title:
+
+- `{{name}}` is a variable from `"vars"`; `{{mod_id}}` and `{{game}}` are always there. `desc-new` fills `name`,
+  `summary`, `version` and `author` from the mod page when the template leaves them empty.
+- `{{> credits}}` inserts the partial `credits.bbcode`: the project's `partials\` first, then the template's, then
+  `_shared\`.
+- `\{{` is a literal `{{`.
+
+A variable or partial that isn't there stops the build and is named in the error, so nothing goes out with a
+placeholder left in it.
+
+**Workflow**
+
+```
+nexus-api-tool desc-init 12345                  start from the live page (or --from-file <saved page>)
+nexus-api-tool desc-new 12345 --template standard
+nexus-api-tool desc-set 12345 intro.install --file install.bbcode
+nexus-api-tool desc-build 12345                 writes build\description.bbcode in the project
+nexus-api-tool desc-diff 12345                  which parts differ from the page
+nexus-api-tool desc-push 12345 --dry-run        backs up and checks, sends nothing
+nexus-api-tool desc-push 12345                  replaces the page
+```
+
+`desc-build` checks that there is no HTML, warns about BBCode tags that don't pair up, and checks that the built page
+splits back into the same parts. `desc-push` keeps a copy of what it pushed; if the page has been edited on the site
+since, the push is refused and lists the changed parts. `desc-pull --write` takes the site's version into the
+project (a part whose file uses template expressions is not overwritten unless you add `--force`); `--force` on
+`desc-push` replaces the site's edits instead. `desc-split --file <page>` shows how a saved page splits.
+
 ### Permissions
 
 ```

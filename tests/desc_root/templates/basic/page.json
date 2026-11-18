@@ -1,0 +1,11 @@
+{
+  "description": "Test template: preamble, two sections, a subsection, a template partial and a shared partial",
+  "vars": {"name": "Test Mod", "tagline": "A test"},
+  "heading": {"section": "[size=5][b]{{title}}[/b][/size]", "subsection": "[size=4][b]{{title}}[/b][/size]"},
+  "preamble": "preamble.bbcode",
+  "sections": [
+    {"id": "intro", "title": "About {{name}}", "file": "intro.bbcode",
+     "subsections": [{"id": "install", "title": "Installation", "file": "intro.install.bbcode"}]},
+    {"id": "credits", "title": "Credits", "file": "credits.bbcode"}
+  ]
+}

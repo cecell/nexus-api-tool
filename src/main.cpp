@@ -94,6 +94,25 @@ COMMANDS                                                                        
                                       is archived), --category main|optional|miscellaneous, --note <text>,
                                       --changelog <text>, --set-mod-version, --dry-run, --allow-html
 
+DESCRIPTION PROJECTS (a mod page kept as BBCode sections, see README)
+  settings [--projects-root <folder>] show or set the folder the projects live in          local
+  desc-templates                      list the templates in <projects root>\templates         local
+  desc-init <mod> [--from-file <f>]   start a project from the page (or a saved page),      v3
+                                      split at its [url=#nat-s-...][/url] section markers
+  desc-new <mod> --template <name>    start a project from a template; --offline skips      v3
+                                      filling name, summary, version and author from the page
+  desc-set <mod> <part> --file <f>    replace one part's text (or --text <text>); a part    local
+                                      is preamble, <section> or <section>.<subsection>
+  desc-build <mod> [--out <file>]     assemble the page: markers, {{vars}}, {{> partials}};  local
+                                      checks HTML, BBCode tags and that it splits back the same
+  desc-diff <mod>                     which parts differ between the project and the page   v3
+  desc-pull <mod> [--write]           what changed on the page; --write takes it in         v3
+  desc-push <mod> [--dry-run]         build and REPLACE the page, backed up first. Refused   v3
+                                      if the page changed on the site since the last push;
+                                      --force replaces it anyway
+  desc-split --file <f>               show how a saved page splits into parts               local
+  Every desc command takes --root <folder> instead of the projects folder from the settings.
+
 OPTIONS
   --game <domain|id>  the game, as its Nexus domain (skyrim, skyrimspecialedition) or its number. Default:
                       the NEXUS_GAME_ID environment variable if it is set, else skyrimspecialedition
@@ -1825,6 +1844,11 @@ const std::vector<CallCost>& call_costs() {
         {"search-files", 0, 2, 0, 0, 0, "+1 GraphQL per 80 results, +1 per range split over 10,000 results"},
         {"save-desc", 0, 0, 1, 0, 0, ""},
         {"set-desc", 0, 0, 3, 0, 0, "1 with --dry-run"},
+        {"desc-init", 0, 0, 1, 0, 0, "0 with --from-file"},
+        {"desc-new", 0, 0, 1, 0, 0, "0 with --offline"},
+        {"desc-diff", 0, 0, 1, 0, 0, ""},
+        {"desc-pull", 0, 0, 1, 0, 0, ""},
+        {"desc-push", 0, 0, 4, 0, 0, "2 with --dry-run"},
         {"upload-file", 0, 0, 6, 0, 1, "about 6 v3 calls; more while Nexus processes a big file; Cloudflare limits the upload"},
     };
     return costs;
@@ -1961,6 +1985,615 @@ bool valid_game(const std::string& s) {
 
 void print(const std::string& text) { std::fwrite(text.data(), 1, text.size(), stdout); }
 
+// ---------------------------------------------------------------- description projects
+//
+// A mod's description kept as a folder of BBCode sections: <projects root>\<game>\<mod id>\page.json + one file per
+// section. The built page marks every section with an empty link to an anchor at the start of its heading line:
+//     [url=#nat-s-<section>][/url]<heading>          [url=#nat-ss-<section>-<subsection>][/url]<heading>
+// That marker renders as nothing, carries the id, and survives a save in the site's editor (tested 2026-11-18: every
+// other empty tag was stripped by the editor, unknown tags show as text). The live page is split at those markers.
+// Templates (<root>\templates\<name>\) have the same layout; {{var}} and {{> partial}} are filled in when a page is built.
+
+fs::path settings_path() { return data_dir() / L"nexus-api-tool-settings.json"; }
+
+json load_settings() {
+    std::error_code ec;
+    if (!fs::exists(settings_path(), ec)) return json::object();
+    json j = json::parse(read_file(settings_path()), nullptr, false);
+    if (j.is_discarded() || !j.is_object()) fail(settings_path().u8string() + " isn't valid JSON; fix or delete it");
+    return j;
+}
+
+fs::path projects_root(const std::string& override_root) {
+    if (!override_root.empty()) return fs::absolute(fs::path(to_wide(override_root)));
+    json s = load_settings();
+    if (!s.contains("projects_root") || !s["projects_root"].is_string() || s["projects_root"].get<std::string>().empty())
+        fail("no projects folder is set. Set one with: nexus-api-tool settings --projects-root <folder> (or pass --root <folder>)");
+    return fs::path(to_wide(s["projects_root"].get<std::string>()));
+}
+
+json cmd_settings(const std::string& new_root) {
+    json s = load_settings();
+    if (!new_root.empty()) {
+        fs::path root = fs::absolute(fs::path(to_wide(new_root)));
+        std::error_code ec;
+        fs::create_directories(root, ec);
+        if (!fs::is_directory(root)) fail("cannot create the folder " + root.u8string());
+        s["projects_root"] = root.u8string();
+        write_file(settings_path(), s.dump(2) + "\n");
+    }
+    json out = {{"settings_file", settings_path().u8string()}};
+    out["projects_root"] = s.contains("projects_root") ? s["projects_root"] : json(nullptr);
+    return out;
+}
+
+bool valid_part_id(const std::string& id) {
+    return !id.empty() && id.size() <= 40 && std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::islower(c) || std::isdigit(c) || c == '_'; });
+}
+
+// One piece of a page: the preamble (id ""), a section (sub "") or a subsection.
+struct DescPart {
+    std::string id, sub, heading, body;
+    std::string key() const { return id.empty() ? "preamble" : sub.empty() ? id : id + "." + sub; }
+};
+
+std::string part_marker(const std::string& id, const std::string& sub) {
+    return sub.empty() ? "[url=#nat-s-" + id + "][/url]" : "[url=#nat-ss-" + id + "-" + sub + "][/url]";
+}
+
+// The marker at the start of a line, if there is one: true and the ids, and where the rest of the line starts.
+bool read_marker(const std::string& line, std::string& id, std::string& sub, size_t& rest) {
+    std::string l = lower(line);
+    if (l.rfind("[url=", 0) != 0) return false;
+    size_t p = 5;
+    if (p < l.size() && l[p] == '"') ++p;
+    if (l.compare(p, 5, "#nat-") != 0) return false;
+    p += 5;
+    bool subsection = l.compare(p, 3, "ss-") == 0;
+    if (!subsection && l.compare(p, 2, "s-") != 0) return false;
+    p += subsection ? 3 : 2;
+    size_t end = l.find(']', p);
+    if (end == std::string::npos) return false;
+    std::string anchor = line.substr(p, end - p);
+    if (!anchor.empty() && anchor.back() == '"') anchor.pop_back();
+    if (l.compare(end, 7, "][/url]") != 0) return false;
+    if (subsection) {
+        size_t dash = anchor.find('-');
+        if (dash == std::string::npos) return false;
+        id = anchor.substr(0, dash);
+        sub = anchor.substr(dash + 1);
+        if (!valid_part_id(id) || !valid_part_id(sub)) return false;
+    } else {
+        id = anchor;
+        sub.clear();
+        if (!valid_part_id(id)) return false;
+    }
+    rest = end + 7;
+    return true;
+}
+
+// Splits a page at its markers. Text before the first marker is the preamble. Every body keeps its own line breaks,
+// so joining the parts again gives the page back exactly.
+std::vector<DescPart> split_description(const std::string& text) {
+    std::vector<DescPart> parts(1);
+    std::set<std::string> seen;
+    std::string current_section;
+    size_t pos = 0;
+    int line_no = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find('\n', pos);
+        size_t line_end = nl == std::string::npos ? text.size() : nl;
+        std::string line = text.substr(pos, line_end - pos);
+        ++line_no;
+        std::string id, sub;
+        size_t rest = 0;
+        if (read_marker(line, id, sub, rest)) {
+            if (!sub.empty() && id != current_section)
+                fail("line " + std::to_string(line_no) + ": subsection " + id + "." + sub + " isn't inside section " + id);
+            DescPart p;
+            p.id = id;
+            p.sub = sub;
+            p.heading = line.substr(rest);
+            if (!seen.insert(p.key()).second) fail("line " + std::to_string(line_no) + ": " + p.key() + " appears twice");
+            if (sub.empty()) current_section = id;
+            parts.push_back(p);
+        } else {
+            parts.back().body += line;
+            if (nl != std::string::npos) parts.back().body += '\n';
+        }
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    return parts;
+}
+
+std::string join_description(const std::vector<DescPart>& parts) {
+    std::string out;
+    for (const auto& p : parts) {
+        if (!p.id.empty()) {
+            if (!out.empty() && out.back() != '\n') out += '\n';
+            out += part_marker(p.id, p.sub) + p.heading + "\n";
+        }
+        out += p.body;
+    }
+    return out;
+}
+
+struct Project {
+    fs::path root, dir;
+    json page;
+    fs::path file(const std::string& name) const { return dir / to_wide(name); }
+};
+
+fs::path project_dir(const fs::path& root, const Target& t) { return root / to_wide(t.game) / to_wide(t.mod); }
+
+Project open_project(const std::string& override_root, const Target& t) {
+    Project p;
+    p.root = projects_root(override_root);
+    p.dir = project_dir(p.root, t);
+    fs::path page = p.dir / L"page.json";
+    if (!fs::exists(page)) fail("no description project for mod " + t.mod + " (" + p.dir.u8string() + "). Start one with desc-init or desc-new");
+    p.page = json::parse(read_file(page), nullptr, false);
+    if (p.page.is_discarded() || !p.page.is_object()) fail(page.u8string() + " isn't valid JSON");
+    if (!p.page.contains("sections")) p.page["sections"] = json::array();
+    return p;
+}
+
+void save_page_json(const Project& p) { write_file(p.dir / L"page.json", p.page.dump(2) + "\n"); }
+
+std::string section_file_name(const std::string& id, const std::string& sub) {
+    return id.empty() ? "preamble.bbcode" : sub.empty() ? id + ".bbcode" : id + "." + sub + ".bbcode";
+}
+
+// {{name}} -> a variable, {{> name}} -> a partial file, \{{ -> a literal {{. A missing variable or partial is collected,
+// not guessed, so nothing goes out with a placeholder still in it.
+struct Renderer {
+    const Project& project;
+    json vars;
+    std::set<std::string> missing;
+
+    std::string partial(const std::string& name) {
+        std::vector<fs::path> where = {project.dir / L"partials"};
+        if (project.page.contains("template") && project.page["template"].is_string())
+            where.push_back(project.root / L"templates" / to_wide(project.page["template"].get<std::string>()) / L"partials");
+        where.push_back(project.root / L"templates" / L"_shared");
+        for (const auto& d : where) {
+            fs::path f = d / to_wide(name + ".bbcode");
+            if (fs::exists(f)) return normalize_text(read_file(f));
+        }
+        missing.insert("partial " + name);
+        return "{{> " + name + "}}";
+    }
+
+    std::string render(const std::string& text, int depth = 0) {
+        if (depth > 10) fail("partials include each other more than 10 deep");
+        std::string out;
+        for (size_t i = 0; i < text.size();) {
+            if (text.compare(i, 3, "\\{{") == 0) {
+                out += "{{";
+                i += 3;
+                continue;
+            }
+            if (text.compare(i, 2, "{{") != 0) {
+                out += text[i++];
+                continue;
+            }
+            size_t end = text.find("}}", i + 2);
+            if (end == std::string::npos) {
+                out += text.substr(i);
+                break;
+            }
+            std::string inner = text.substr(i + 2, end - i - 2);
+            auto trim = [](std::string s) {
+                size_t a = s.find_first_not_of(" \t"), b = s.find_last_not_of(" \t");
+                return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+            };
+            inner = trim(inner);
+            if (!inner.empty() && inner[0] == '>') {
+                out += render(partial(trim(inner.substr(1))), depth + 1);
+            } else if (vars.contains(inner) && !vars[inner].is_null()) {
+                out += vars[inner].is_string() ? vars[inner].get<std::string>() : vars[inner].dump();
+            } else {
+                missing.insert(inner);
+                out += text.substr(i, end + 2 - i);
+            }
+            i = end + 2;
+        }
+        return out;
+    }
+};
+
+// Tags whose [x]..[/x] must pair up. [*], [line] and [hr] stand alone.
+std::vector<std::string> bbcode_balance_warnings(const std::string& text) {
+    static const std::set<std::string> paired = {"b", "i", "u", "s", "size", "color", "font", "url", "img", "quote", "code", "spoiler",
+                                                 "center", "left", "right", "justify", "list", "heading", "youtube", "email", "sup", "sub"};
+    std::vector<std::pair<std::string, int>> stack;
+    std::vector<std::string> warnings;
+    int line = 1;
+    for (size_t i = 0; i < text.size() && warnings.size() < 10; ++i) {
+        if (text[i] == '\n') ++line;
+        if (text[i] != '[') continue;
+        size_t end = text.find(']', i);
+        if (end == std::string::npos || end - i > 300) continue;
+        std::string inner = lower(text.substr(i + 1, end - i - 1));
+        bool closing = !inner.empty() && inner[0] == '/';
+        if (closing) inner.erase(0, 1);
+        std::string name = inner.substr(0, std::min(inner.find('='), inner.find(' ')));
+        if (!paired.count(name)) continue;
+        if (!closing) {
+            stack.push_back({name, line});
+        } else if (!stack.empty() && stack.back().first == name) {
+            stack.pop_back();
+        } else {
+            warnings.push_back("line " + std::to_string(line) + ": [/" + name + "] has no matching [" + name + "]" +
+                               (stack.empty() ? "" : " (the open tag is [" + stack.back().first + "] from line " + std::to_string(stack.back().second) + ")"));
+            auto it = std::find_if(stack.rbegin(), stack.rend(), [&](const auto& e) { return e.first == name; });
+            if (it != stack.rend()) stack.erase(std::next(it).base(), stack.end());
+        }
+    }
+    for (const auto& e : stack)
+        if (warnings.size() < 10) warnings.push_back("line " + std::to_string(e.second) + ": [" + e.first + "] is never closed");
+    return warnings;
+}
+
+struct Built {
+    std::string text;
+    std::vector<DescPart> parts;
+    std::vector<std::string> warnings;
+};
+
+// Reads every part's file, fills in the template expressions, puts the markers in and checks the result.
+Built build_description(const Project& p, const Target& t, bool allow_html) {
+    Renderer r{p, p.page.value("vars", json::object()), {}};
+    r.vars["mod_id"] = t.mod;
+    r.vars["game"] = t.game;
+    json heading_style = p.page.value("heading", json::object());
+    std::string section_style = heading_style.value("section", std::string("[size=5][b]{{title}}[/b][/size]"));
+    std::string sub_style = heading_style.value("subsection", std::string("[size=4][b]{{title}}[/b][/size]"));
+
+    auto body_of = [&](const std::string& file) {
+        fs::path f = p.file(file);
+        if (!fs::exists(f)) fail("missing section file " + f.u8string());
+        std::string raw = read_file(f);
+        if (raw.rfind("\xEF\xBB\xBF", 0) == 0) raw.erase(0, 3);
+        std::string text;
+        for (char c : raw)
+            if (c != '\r') text += c;
+        if (!text.empty() && text.back() != '\n') text += '\n';  // the next marker must start a line
+        return r.render(text);
+    };
+    auto heading_of = [&](const json& s, const std::string& style) {
+        if (s.contains("heading") && s["heading"].is_string()) return r.render(s["heading"].get<std::string>());
+        Renderer local = r;
+        local.vars["title"] = r.render(s.value("title", s.value("id", std::string())));  // a title may use {{vars}} too
+        std::string h = local.render(style);
+        r.missing.insert(local.missing.begin(), local.missing.end());
+        return h;
+    };
+
+    Built b;
+    DescPart pre;
+    std::string pre_file = p.page.value("preamble", std::string());
+    if (!pre_file.empty()) pre.body = body_of(pre_file);
+    b.parts.push_back(pre);
+    std::set<std::string> ids;
+    for (const auto& s : p.page["sections"]) {
+        std::string id = s.value("id", std::string());
+        if (!valid_part_id(id)) fail("page.json: section id \"" + id + "\" must be 1-40 characters of a-z, 0-9 and _");
+        if (!ids.insert(id).second) fail("page.json: section " + id + " is listed twice");
+        DescPart sec{id, "", heading_of(s, section_style), body_of(s.value("file", section_file_name(id, "")))};
+        b.parts.push_back(sec);
+        std::set<std::string> subs;
+        for (const auto& ss : s.value("subsections", json::array())) {
+            std::string sub = ss.value("id", std::string());
+            if (!valid_part_id(sub)) fail("page.json: subsection id \"" + id + "." + sub + "\" must be 1-40 characters of a-z, 0-9 and _");
+            if (!subs.insert(sub).second) fail("page.json: subsection " + id + "." + sub + " is listed twice");
+            b.parts.push_back({id, sub, heading_of(ss, sub_style), body_of(ss.value("file", section_file_name(id, sub)))});
+        }
+    }
+    if (!r.missing.empty()) {
+        std::string list;
+        for (const auto& m : r.missing) list += (list.empty() ? "" : ", ") + m;
+        fail("not filled in: " + list + ". Set them under \"vars\" in page.json (or add the partial files)");
+    }
+    b.text = normalize_text(join_description(b.parts));
+
+    // A body must not contain a marker of its own, or the page would split differently than it was built.
+    std::vector<DescPart> again = split_description(b.text);
+    if (again.size() != b.parts.size()) fail("a section's text contains a [url=#nat-...][/url] marker at the start of a line; remove it");
+    for (size_t i = 0; i < again.size(); ++i)
+        if (again[i].key() != b.parts[i].key()) fail("a section's text contains a marker for " + again[i].key() + "; remove it");
+    check_no_html("the built description", b.text, allow_html);
+    if (!valid_utf8(b.text)) fail("the built description isn't valid UTF-8; save the section files as UTF-8");
+    b.warnings = bbcode_balance_warnings(b.text);
+    return b;
+}
+
+json parts_summary(const std::vector<DescPart>& parts) {
+    json a = json::array();
+    for (const auto& p : parts) a.push_back({{"part", p.key()}, {"chars", p.body.size()}});
+    return a;
+}
+
+// Writes a split page into a project folder: page.json lists the parts, each body goes to its own file.
+// A heading that the page.json heading style wouldn't produce is kept as it is ("heading").
+void write_parts(Project& p, const std::vector<DescPart>& parts) {
+    json sections = json::array();
+    for (const auto& part : parts) {
+        std::string body = part.body;
+        for (size_t at = 0; (at = body.find("{{", at)) != std::string::npos; at += 3) body.insert(at, "\\");  // literal, not a template
+        std::string file = section_file_name(part.id, part.sub);
+        write_file(p.file(file), body);
+        if (part.id.empty()) {
+            p.page["preamble"] = file;
+            continue;
+        }
+        json entry = {{"id", part.sub.empty() ? part.id : part.sub}, {"heading", part.heading}, {"file", file}};
+        if (part.sub.empty()) {
+            sections.push_back(entry);
+        } else {
+            if (!sections.back().contains("subsections")) sections.back()["subsections"] = json::array();
+            sections.back()["subsections"].push_back(entry);
+        }
+    }
+    p.page["sections"] = sections;
+}
+
+std::string live_description(const Target& t) { return normalize_text(clean_text(text_of(v3_mod(t), "description"))); }
+
+fs::path snapshot_path(const Project& p) { return p.dir / L".nat" / L"last_pushed.bbcode"; }
+
+json cmd_desc_init(const Target& t, const std::string& root_opt, const std::string& from_file, bool force) {
+    Project p;
+    p.root = projects_root(root_opt);
+    p.dir = project_dir(p.root, t);
+    if (fs::exists(p.dir / L"page.json") && !force) fail(p.dir.u8string() + " already has a project (--force replaces it)");
+    std::string text = from_file.empty() ? live_description(t) : normalize_text(read_file(fs::path(to_wide(from_file))));
+    std::vector<DescPart> parts = split_description(text);
+    p.page = {{"mod_id", t.mod_id()}, {"game", t.game}, {"vars", json::object()},
+              {"heading", {{"section", "[size=5][b]{{title}}[/b][/size]"}, {"subsection", "[size=4][b]{{title}}[/b][/size]"}}}};
+    write_parts(p, parts);
+    save_page_json(p);
+    if (from_file.empty()) write_file(snapshot_path(p), text + "\n");
+    json out = t.header();
+    out["project"] = p.dir.u8string();
+    out["parts"] = parts_summary(parts);
+    if (parts.size() == 1)
+        out["note"] = "the page has no [url=#nat-s-...][/url] markers, so all of it is the preamble. Split it into sections in page.json "
+                      "or start a marked page with desc-new";
+    return out;
+}
+
+json cmd_desc_templates(const std::string& root_opt) {
+    fs::path dir = projects_root(root_opt) / L"templates";
+    json list = json::array();
+    std::error_code ec;
+    if (fs::is_directory(dir, ec)) {
+        for (const auto& e : fs::directory_iterator(dir)) {
+            if (!e.is_directory() || e.path().filename() == L"_shared") continue;
+            json item = {{"name", e.path().filename().u8string()}};
+            fs::path page = e.path() / L"page.json";
+            if (fs::exists(page)) {
+                json j = json::parse(read_file(page), nullptr, false);
+                if (!j.is_discarded()) {
+                    item["description"] = j.value("description", std::string());
+                    json ids = json::array();
+                    for (const auto& s : j.value("sections", json::array())) ids.push_back(s.value("id", std::string()));
+                    item["sections"] = ids;
+                }
+            } else {
+                item["problem"] = "no page.json";
+            }
+            list.push_back(item);
+        }
+    }
+    return {{"templates_folder", dir.u8string()}, {"templates", list}};
+}
+
+json cmd_desc_new(const Target& t, const std::string& root_opt, const std::string& name, bool force, bool offline) {
+    Project p;
+    p.root = projects_root(root_opt);
+    p.dir = project_dir(p.root, t);
+    fs::path src = p.root / L"templates" / to_wide(name);
+    if (!fs::exists(src / L"page.json")) fail("no template " + name + " (" + src.u8string() + "); desc-templates lists them");
+    if (fs::exists(p.dir / L"page.json") && !force) fail(p.dir.u8string() + " already has a project (--force replaces it)");
+    fs::create_directories(p.dir);
+    fs::copy(src, p.dir, fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+    p.page = json::parse(read_file(p.dir / L"page.json"), nullptr, false);
+    if (p.page.is_discarded()) fail("the template's page.json isn't valid JSON");
+    p.page.erase("description");
+    p.page["template"] = name;
+    p.page["mod_id"] = t.mod_id();
+    p.page["game"] = t.game;
+    if (!p.page.contains("vars") || !p.page["vars"].is_object()) p.page["vars"] = json::object();
+    json filled = json::array();
+    if (!offline) {  // what the page already knows about the mod
+        json mod = v3_mod(t);
+        for (const char* k : {"name", "summary", "version", "author"}) {
+            std::string v = text_of(mod, k);
+            if (!v.empty() && (!p.page["vars"].contains(k) || p.page["vars"][k].is_null() || p.page["vars"][k] == "")) {
+                p.page["vars"][k] = clean_text(v);
+                filled.push_back(k);
+            }
+        }
+    }
+    save_page_json(p);
+    json out = t.header();
+    out["project"] = p.dir.u8string();
+    out["template"] = name;
+    out["vars_from_the_mod_page"] = filled;
+    out["next"] = "fill in the section files and \"vars\" in page.json, then desc-build";
+    return out;
+}
+
+json cmd_desc_build(const Target& t, const std::string& root_opt, const std::string& out_file, bool allow_html) {
+    Project p = open_project(root_opt, t);
+    Built b = build_description(p, t, allow_html);
+    fs::path target = out_file.empty() ? p.dir / L"build" / L"description.bbcode" : fs::path(to_wide(out_file));
+    write_file(target, b.text + "\n");
+    json out = t.header();
+    out["built"] = fs::absolute(target).u8string();
+    out["chars"] = b.text.size();
+    out["parts"] = parts_summary(b.parts);
+    out["round_trip"] = true;
+    if (!b.warnings.empty()) out["warnings"] = b.warnings;
+    return out;
+}
+
+json cmd_desc_set(const Target& t, const std::string& root_opt, const std::string& part, const std::string& file, const std::string& text_opt) {
+    if (file.empty() == text_opt.empty()) bad_args("desc-set takes --file <path> or --text <text>");
+    Project p = open_project(root_opt, t);
+    std::string id = part, sub;
+    size_t dot = part.find('.');
+    if (dot != std::string::npos) {
+        id = part.substr(0, dot);
+        sub = part.substr(dot + 1);
+    }
+    std::string target_file;
+    if (part == "preamble") {
+        target_file = p.page.value("preamble", std::string("preamble.bbcode"));
+        p.page["preamble"] = target_file;
+    } else {
+        for (const auto& s : p.page["sections"]) {
+            if (s.value("id", std::string()) != id) continue;
+            if (sub.empty()) {
+                target_file = s.value("file", section_file_name(id, ""));
+            } else {
+                for (const auto& ss : s.value("subsections", json::array()))
+                    if (ss.value("id", std::string()) == sub) target_file = ss.value("file", section_file_name(id, sub));
+            }
+        }
+    }
+    if (target_file.empty()) {
+        std::string ids = "preamble";
+        for (const auto& s : p.page["sections"]) {
+            ids += ", " + s.value("id", std::string());
+            for (const auto& ss : s.value("subsections", json::array())) ids += ", " + s.value("id", std::string()) + "." + ss.value("id", std::string());
+        }
+        fail("no part " + part + " in page.json; the parts are " + ids);
+    }
+    std::string text = file.empty() ? text_opt : read_file(fs::path(to_wide(file)));
+    if (!valid_utf8(text)) fail("the new text isn't valid UTF-8");
+    text = normalize_text(text) + "\n";
+    write_file(p.file(target_file), text);
+    save_page_json(p);
+    json out = t.header();
+    out["part"] = part;
+    out["file"] = p.file(target_file).u8string();
+    out["chars"] = text.size();
+    return out;
+}
+
+// Which parts differ between two split pages (by key; "added" = only in b, "removed" = only in a).
+json compare_parts(const std::vector<DescPart>& a, const std::vector<DescPart>& b) {
+    std::map<std::string, const DescPart*> ma, mb;
+    for (const auto& p : a) ma[p.key()] = &p;
+    for (const auto& p : b) mb[p.key()] = &p;
+    json changed = json::array(), added = json::array(), removed = json::array();
+    for (const auto& [k, p] : ma) {
+        auto it = mb.find(k);
+        if (it == mb.end()) removed.push_back(k);
+        else if (normalize_text(p->body) != normalize_text(it->second->body) || p->heading != it->second->heading) changed.push_back(k);
+    }
+    for (const auto& [k, p] : mb)
+        if (!ma.count(k)) added.push_back(k);
+    return {{"changed", changed}, {"only_on_the_page", added}, {"only_in_the_project", removed}};
+}
+
+json cmd_desc_diff(const Target& t, const std::string& root_opt, bool allow_html) {
+    Project p = open_project(root_opt, t);
+    Built b = build_description(p, t, allow_html);
+    std::string live = live_description(t);
+    json out = t.header();
+    out["same"] = live == b.text;
+    out["parts"] = compare_parts(b.parts, split_description(live));
+    return out;
+}
+
+json cmd_desc_pull(const Target& t, const std::string& root_opt, bool write, bool force) {
+    Project p = open_project(root_opt, t);
+    std::string live = live_description(t);
+    std::vector<DescPart> live_parts = split_description(live);
+    Built b = build_description(p, t, true);
+    json out = t.header();
+    out["parts"] = compare_parts(b.parts, live_parts);
+    if (!write) {
+        out["note"] = "nothing written; --write takes the page's version of every changed part into the project";
+        return out;
+    }
+    // A part whose file has template expressions would lose them; those are listed, not overwritten.
+    std::set<std::string> templated;
+    auto has_expr = [&](const std::string& file) {
+        fs::path f = p.file(file);
+        return fs::exists(f) && read_file(f).find("{{") != std::string::npos;
+    };
+    if (has_expr(p.page.value("preamble", std::string("preamble.bbcode")))) templated.insert("preamble");
+    for (const auto& s : p.page["sections"]) {
+        std::string id = s.value("id", std::string());
+        if (has_expr(s.value("file", section_file_name(id, "")))) templated.insert(id);
+        for (const auto& ss : s.value("subsections", json::array()))
+            if (has_expr(ss.value("file", section_file_name(id, ss.value("id", std::string()))))) templated.insert(id + "." + ss.value("id", std::string()));
+    }
+    json kept = json::array();
+    if (!force) {
+        for (auto& part : live_parts) {
+            if (!templated.count(part.key())) continue;
+            auto mine = std::find_if(b.parts.begin(), b.parts.end(), [&](const DescPart& x) { return x.key() == part.key(); });
+            if (mine != b.parts.end() && normalize_text(mine->body) != normalize_text(part.body)) kept.push_back(part.key());
+        }
+        if (!kept.empty()) {
+            out["not_written"] = kept;
+            fail("these parts changed on the page but their files use template expressions, which taking the page's text would remove: " +
+                 kept.dump() + ". Copy the change into the file by hand, or use --force to take the page's text anyway");
+        }
+    }
+    json vars = p.page.value("vars", json::object());
+    json tmpl = p.page.value("template", json(nullptr));
+    json heading = p.page.value("heading", json::object());
+    write_parts(p, live_parts);
+    p.page["vars"] = vars;
+    if (!tmpl.is_null()) p.page["template"] = tmpl;
+    p.page["heading"] = heading;
+    save_page_json(p);
+    write_file(snapshot_path(p), live + "\n");
+    out["written"] = true;
+    return out;
+}
+
+json cmd_desc_push(const Target& t, const std::string& root_opt, bool dry_run, bool force, bool allow_html) {
+    Project p = open_project(root_opt, t);
+    Built b = build_description(p, t, allow_html);
+    fs::path built = p.dir / L"build" / L"description.bbcode";
+    write_file(built, b.text + "\n");
+    std::string live = live_description(t);
+    fs::path snap = snapshot_path(p);
+    json out = t.header();
+    if (!force) {
+        if (!fs::exists(snap)) {
+            if (!live.empty() && live != b.text)
+                fail("this project has never been pushed or pulled, and the page has text that isn't in it. desc-pull shows the difference; "
+                     "--force replaces the page anyway");
+        } else if (normalize_text(read_file(snap)) != live) {
+            json diff = compare_parts(split_description(normalize_text(read_file(snap))), split_description(live));
+            fail("the page was changed on the site since the last push (" + diff.dump() + "). Take those changes with desc-pull --write, "
+                 "or use --force to replace them");
+        }
+    }
+    json result = cmd_set_desc(t, built.u8string(), (p.dir / L"backups").u8string(), dry_run, allow_html);
+    if (!dry_run) write_file(snap, b.text + "\n");
+    out["push"] = result;
+    out["parts"] = parts_summary(b.parts);
+    if (!b.warnings.empty()) out["warnings"] = b.warnings;
+    return out;
+}
+
+json cmd_desc_split(const std::string& file) {
+    std::vector<DescPart> parts = split_description(normalize_text(read_file(fs::path(to_wide(file)))));
+    json a = json::array();
+    for (const auto& p : parts) a.push_back({{"part", p.key()}, {"heading", p.heading}, {"chars", p.body.size()}});
+    return {{"file", file}, {"parts", a}};
+}
+
 struct CommandSpec {
     const char* name;
     int positional;                 // arguments after the command
@@ -1972,6 +2605,16 @@ const std::vector<CommandSpec>& command_specs() {
     static const std::set<std::string> paged = {"--limit", "--offset"};
     static const std::vector<CommandSpec> specs = {
         {"search-files", 0, {"--ext", "--mod-range", "--name", "--max-results"}, false},
+        {"settings", 0, {"--projects-root"}, false},
+        {"desc-templates", 0, {"--root"}, false},
+        {"desc-split", 0, {"--file"}, false},
+        {"desc-init", 1, {"--root", "--from-file", "--force"}, false},
+        {"desc-new", 1, {"--root", "--template", "--force", "--offline"}, false},
+        {"desc-set", 2, {"--root", "--file", "--text"}, false},
+        {"desc-build", 1, {"--root", "--out", "--allow-html"}, false},
+        {"desc-diff", 1, {"--root", "--allow-html"}, false},
+        {"desc-pull", 1, {"--root", "--write", "--force"}, false},
+        {"desc-push", 1, {"--root", "--dry-run", "--force", "--allow-html"}, false},
         {"desc", 1, {"--plain"}, true},
         {"changelog", 1, {"--plain"}, true},
         {"files", 1, {}, true},
@@ -2053,12 +2696,19 @@ json run_one(const CommandSpec& spec, const std::vector<std::string>& positional
         if (ext.empty() && !has("--name")) bad_args("search-files needs --ext or --name");
         return cmd_search_files(game, lower(ext), lo, hi, option("--name"), max_results);
     }
+    if (command == "settings" || command == "desc-templates" || command == "desc-split") {
+        if (positional.size() != 1) bad_args(command + " takes no mod id");
+        if (command == "settings") return cmd_settings(option("--projects-root"));
+        if (command == "desc-templates") return cmd_desc_templates(option("--root"));
+        if (option("--file").empty()) bad_args("desc-split needs --file <saved page>");
+        return cmd_desc_split(option("--file"));
+    }
     bool lists_user = command == "list-mods";
     bool takes_file = spec.positional == 2;
     if (static_cast<int>(positional.size()) != spec.positional + 1)
         bad_args(command + (lists_user ? " needs a user name" : takes_file ? " needs a mod id and a file number" : " needs a mod id"));
     if (!lists_user && !all_digits(positional[1])) bad_args("the mod id must be a number");
-    if (takes_file && !all_digits(positional[2])) bad_args("the file number must be a number");
+    if (takes_file && command != "desc-set" && !all_digits(positional[2])) bad_args("the file number must be a number");
     if ((command == "dl-file" || command == "save-desc") && option("--dest").empty()) bad_args(command + " needs --dest <path>");
     if ((command == "set-desc" || command == "upload-file") && option("--file").empty()) bad_args(command + " needs --file <path>");
     if (command == "upload-file" && (option("--name").empty() || option("--file-version").empty())) bad_args("upload-file needs --name and --file-version");
@@ -2072,6 +2722,19 @@ json run_one(const CommandSpec& spec, const std::vector<std::string>& positional
     if (!limit_text.empty()) t.limit = std::stoi(limit_text);
     if (t.limit < 1 || t.limit > kMaxLimit) bad_args("--limit must be 1 to " + std::to_string(kMaxLimit) + "; use --offset to read further");
 
+    if (command.rfind("desc-", 0) == 0) {
+        std::string root = option("--root");
+        if (command == "desc-init") return cmd_desc_init(t, root, option("--from-file"), has("--force"));
+        if (command == "desc-new") {
+            if (option("--template").empty()) bad_args("desc-new needs --template <name>");
+            return cmd_desc_new(t, root, option("--template"), has("--force"), has("--offline"));
+        }
+        if (command == "desc-set") return cmd_desc_set(t, root, positional[2], option("--file"), option("--text"));
+        if (command == "desc-build") return cmd_desc_build(t, root, option("--out"), has("--allow-html"));
+        if (command == "desc-diff") return cmd_desc_diff(t, root, has("--allow-html"));
+        if (command == "desc-pull") return cmd_desc_pull(t, root, has("--write"), has("--force"));
+        if (command == "desc-push") return cmd_desc_push(t, root, has("--dry-run"), has("--force"), has("--allow-html"));
+    }
     if (command == "desc") return cmd_desc(t, has("--plain"));
     if (command == "changelog") return cmd_changelog(t, has("--plain"));
     if (command == "files") return cmd_files(t, false);
@@ -2168,9 +2831,10 @@ int run_list(const CommandSpec& spec, const std::string& list_file, std::map<std
 
 int run(const std::vector<std::string>& args) {
     static const std::set<std::string> with_value = {"--game", "--dest", "--offset", "--file", "--backup-dir", "--name", "--file-version", "--replaces",
-                                                     "--category", "--note", "--changelog", "--list", "--interval", "--max-size", "--per", "--html", "--ext", "--mod-range", "--max-results"};
+                                                     "--category", "--note", "--changelog", "--list", "--interval", "--max-size", "--per", "--html", "--ext", "--mod-range", "--max-results",
+                                                     "--root", "--projects-root", "--from-file", "--template", "--text", "--out"};
     static const std::set<std::string> flags = {"--force", "--dry-run", "--allow-html", "--set-mod-version", "--skip-existing", "--verbose",
-                                                "--rate", "--rates", "--limits", "--usage", "--plain"};
+                                                "--rate", "--rates", "--limits", "--usage", "--plain", "--write", "--offline"};
     std::vector<std::string> positional;
     std::map<std::string, std::string> options;
     bool help = false, limit_flag = false;
